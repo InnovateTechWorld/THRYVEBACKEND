@@ -76,15 +76,28 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
   ];
 
   // Allow all exported API endpoints without auth
-  if (request.url.startsWith('/api/exported/context/v1/') ||
-      request.url.startsWith('/api/exported/session/v1/') ||
-      request.url.startsWith('/api/exported/v1/models') ||
-      // Fix: Add these patterns to allow model endpoints
-      request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/models$/) ||
-      request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/chat\/completions$/)) {
-    return; 
+  if (
+    // New Bearer token endpoints
+    request.url.startsWith('/api/exported/context/v1/') ||
+    request.url.startsWith('/api/exported/session/v1/') ||
+    request.url === '/api/exported/v1/models' ||
+    
+    // Legacy path-based endpoints
+    request.url.startsWith('/api/exported/context/') ||
+    request.url.startsWith('/api/exported/session/') ||
+    
+    // Models endpoints (both styles)
+    request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/models$/) ||
+    request.url.match(/\/api\/exported\/v1\/models$/) ||
+    
+    // Chat completions endpoints
+    request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/chat\/completions$/) ||
+    request.url.match(/\/api\/exported\/(context|session)\/v1\/chat\/completions$/)
+  ) {
+    return; // Skip auth for exported API endpoints
   }
-  
+
+  // Legacy parameter-based routes
   if ((request.url.startsWith('/api/exported/context/') || request.url.startsWith('/api/exported/session/')) &&
       request.params && (request.params as any).apiKey) {
       return; 
@@ -94,6 +107,7 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
     return;
   }
 
+  
   try {
     const authHeader = request.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {

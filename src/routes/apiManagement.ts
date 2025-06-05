@@ -2,10 +2,9 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { EncryptionUtils } from '../utils/encryption';
 import { verifyExportedApiKey, logApiUsage } from '../lib/apiUtils';
-import { getUserContext, buildContextAwareMessages, UserContextData } from '../lib/context';
-import { callOpenRouter, filterRelevantContext } from '../lib/ai';
+import { getUserContext, buildExportedContextAwareMessages, buildExportedSessionAwareMessages, processMessageContent, extractOpenAIParameters } from '../lib/context';
+import { callOpenRouter, filterRelevantContext, getModelCapabilities } from '../lib/ai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-
 
 interface ExportContextBody {
   modelsToExpose: string[];
@@ -24,6 +23,37 @@ interface ExportSessionParams {
 }
 
 interface ExportUsageParams {
+  apiKey: string;
+}
+
+// Enhanced chat completions body for legacy endpoints
+interface LegacyChatCompletionsBody {
+  model?: string;
+  messages: any[];
+  stream?: boolean;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  top_k?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  repetition_penalty?: number;
+  min_p?: number;
+  stop?: string | string[];
+  reasoning?: boolean;
+  include_reasoning?: boolean;
+  tools?: any[];
+  tool_choice?: any;
+  response_format?: any;
+  structured_outputs?: boolean;
+  logit_bias?: Record<string, number>;
+  logprobs?: boolean;
+  top_logprobs?: number;
+  seed?: number;
+  system_prompt?: string; // Custom system prompt override
+}
+
+interface LegacyChatCompletionsParams {
   apiKey: string;
 }
 
@@ -176,265 +206,529 @@ export default async function apiManagementRoutes(
     }
   );
 
-    interface ExportedChatCompletionsBody {
-        model: string;
-        messages: any[];
-        stream?: boolean;
-        temperature?: number;
-        max_tokens?: number;
-        top_p?: number;
-        frequency_penalty?: number;
-        presence_penalty?: number;
-    }
-    interface ExportedChatCompletionsParams {
-        apiKey: string;
-    }
+  // Enhanced legacy context API endpoint
+  fastify.post(
+    '/api/exported/context/:apiKey/chat/completions',
+    async (request: FastifyRequest<{ Params: LegacyChatCompletionsParams, Body: LegacyChatCompletionsBody }>, reply: FastifyReply) => {
+      const { apiKey } = request.params;
+      const body = request.body;
+      const startTime = Date.now();
+      let promptTokens = 0;
+      let completionTokens = 0;
 
-    fastify.post(
-        '/api/exported/context/:apiKey/chat/completions',
-        async (request: FastifyRequest<{ Params: ExportedChatCompletionsParams, Body: ExportedChatCompletionsBody }>, reply: FastifyReply) => {
-            const { apiKey } = request.params;
-            const { model, messages, stream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty } = request.body;
-            const startTime = Date.now();
-            let promptTokens = 0;
-            let completionTokens = 0;
+      try {
+        const exportData = await verifyExportedApiKey(apiKey, 'context', supabase, fastify.log);
 
-            try {
-                const exportData = await verifyExportedApiKey(apiKey, 'context', supabase, fastify.log);
-                if (!exportData.allowed_models || !exportData.allowed_models.includes(model)) {
-                    return reply.code(403).send({ error: 'Model not allowed' });
-                }
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Request Started',
+          apiKeyId: exportData.id,
+          userId: exportData.user_id,
+          model: body.model || exportData.base_model,
+          includeMemories: exportData.include_memories,
+          includeNotes: exportData.include_notes,
+          thirdPartySystemPrompt: body.system_prompt ? 'PROVIDED' : 'NOT_PROVIDED'
+        });
 
-                const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
-                let contentForFiltering = '';
-                const lastMessage = messages[messages.length - 1];
-                if (lastMessage && lastMessage.content) {
-                    if (typeof lastMessage.content === 'string') contentForFiltering = lastMessage.content;
-                    else if (Array.isArray(lastMessage.content)) {
-                        const textParts = lastMessage.content.filter((part: any) => part.type === 'text');
-                        contentForFiltering = textParts.map((part: any) => part.text).join(' ');
-                    }
-                }
+        // Extract and validate parameters
+        const params = extractOpenAIParameters(body);
+        const modelToUse = params.model || exportData.base_model;
 
-                if (contentForFiltering.trim() && (userContext.memories.length > 0 || userContext.notes.length > 0)) {
-                    const { relevantMemories, relevantNotes } = await filterRelevantContext(contentForFiltering, userContext.memories, userContext.notes, genAI, fastify.log);
-                    userContext.relevantMemories = relevantMemories;
-                    userContext.relevantNotes = relevantNotes;
-                } else {
-                    userContext.relevantMemories = [];
-                    userContext.relevantNotes = [];
-                }
-                
-                const contextAwareMessages = buildContextAwareMessages(userContext, [], messages, exportData);
-
-                const openRouterBody: any = { model, messages: contextAwareMessages, stream: stream || false, temperature, max_tokens, top_p, frequency_penalty, presence_penalty };
-                Object.keys(openRouterBody).forEach(key => openRouterBody[key] === undefined && delete openRouterBody[key]);
-
-                const openRouterResponse = await callOpenRouter(model, contextAwareMessages, openRouterApiKey, stream || false);
-
-                if (stream) {
-                    reply.raw.writeHead(200, { 
-                        'Content-Type': 'text/event-stream', 
-                        'Cache-Control': 'no-cache', 
-                        'Connection': 'keep-alive',
-                        'Access-Control-Allow-Origin': '*', 
-                        'Access-Control-Allow-Headers': 'Content-Type, Authorization', 
-                    });
-                    const reader = openRouterResponse.body?.getReader();
-                    if (!reader) throw new Error("Failed to get stream reader");
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    let fullResponseText = ''; 
-
-                    try {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-
-                            buffer += decoder.decode(value, { stream: true });
-                            
-                            while(true) {
-                                const lineEnd = buffer.indexOf('\n');
-                                if (lineEnd === -1) break;
-
-                                const line = buffer.slice(0, lineEnd).trim();
-                                buffer = buffer.slice(lineEnd + 1);
-
-                                if (line.startsWith('data: ')) {
-                                    const data = line.slice(6);
-                                    if (data === '[DONE]') {
-                                        reply.raw.write(line + '\n\n');
-                                        break; 
-                                    }
-                                    try {
-                                        const parsed = JSON.parse(data);
-                                        if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                                            fullResponseText += parsed.choices[0].delta.content;
-                                        }
-                                        if (parsed.usage) { 
-                                            promptTokens = parsed.usage.prompt_tokens || promptTokens;
-                                            completionTokens = parsed.usage.completion_tokens || completionTokens;
-                                        }
-                                    } catch (e) {
-                                        fastify.log.warn({msg: "Error parsing stream data chunk", dataChunk: data, err: e});
-                                    }
-                                    reply.raw.write(line + '\n\n');
-                                }
-                            }
-                        }
-                    } finally {
-                        reader.releaseLock();
-                        reply.raw.end();
-                    }
-                } else {
-                    const responseData: any = await openRouterResponse.json();
-                    if (responseData.usage) {
-                        promptTokens = responseData.usage.prompt_tokens || 0;
-                        completionTokens = responseData.usage.completion_tokens || 0;
-                    }
-                    reply.code(200).send(responseData);
-                }
-                
-                const responseTimeMs = Date.now() - startTime;
-                // Corrected order: apiKey, userId, endpoint, model, supabase, logger, promptTokens, completionTokens, responseTimeMs
-                await logApiUsage(apiKey, exportData.user_id, '/api/exported/context/chat/completions', model, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
-
-            } catch (error: any) {
-                fastify.log.error({ msg: 'Context API consumption error', err: error, apiKey });
-                if (!reply.sent) reply.code(500).send({ error: error.message });
-                else if (!reply.raw.writableEnded) reply.raw.end();
+        if (!exportData.allowed_models || !exportData.allowed_models.includes(modelToUse)) {
+          return reply.code(403).send({
+            error: {
+              message: `Model '${modelToUse}' not allowed for this API key`,
+              type: 'invalid_request_error',
+              code: 'model_not_allowed'
             }
+          });
         }
-    );
 
-    fastify.post(
-        '/api/exported/session/:apiKey/chat/completions',
-        async (request: FastifyRequest<{ Params: ExportedChatCompletionsParams, Body: ExportedChatCompletionsBody }>, reply: FastifyReply) => {
-            const { apiKey } = request.params;
-            const { model, messages: newMessages, stream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty } = request.body;
-            const startTime = Date.now();
-            let promptTokens = 0;
-            let completionTokens = 0;
+        // Get model capabilities
+        const modelCapabilities = getModelCapabilities(modelToUse);
 
-            try {
-                const exportData = await verifyExportedApiKey(apiKey, 'session', supabase, fastify.log);
-                 if (!exportData.session_id) {
-                    return reply.code(400).send({ error: 'API key is not configured for a specific session.' });
-                }
-                if (!exportData.allowed_models || !exportData.allowed_models.includes(model)) {
-                    return reply.code(403).send({ error: 'Model not allowed' });
-                }
+        // STEP 1: Get user context
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Step 1: Getting User Context',
+          userId: exportData.user_id
+        });
+        const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Step 1 Complete: User Context Retrieved',
+          memoriesCount: userContext.memories.length,
+          notesCount: userContext.notes.length,
+          userSystemPrompt: userContext.systemPrompt
+        });
 
-                const { data: sessionHistoryData, error: historyError } = await supabase
-                    .from('chat_history')
-                    .select('content, role')
-                    .eq('session_id', exportData.session_id)
-                    .eq('user_id', exportData.user_id)
-                    .order('created_at', { ascending: true });
-                if (historyError) throw historyError;
-                const sessionHistory = (sessionHistoryData || []).map((msg: any) => ({ role: msg.role, content: msg.content }));
+        // STEP 2: Filter relevant context if there's content to filter
+        let contentForFiltering = '';
+        const lastMessage = body.messages[body.messages.length - 1];
+        if (lastMessage?.content) {
+          contentForFiltering = processMessageContent(lastMessage.content);
+        }
 
-                const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
-                let contentForFiltering = '';
-                const lastMessage = newMessages[newMessages.length - 1];
-                if (lastMessage && lastMessage.content) {
-                     if (typeof lastMessage.content === 'string') contentForFiltering = lastMessage.content;
-                    else if (Array.isArray(lastMessage.content)) {
-                        const textParts = lastMessage.content.filter((part: any) => part.type === 'text');
-                        contentForFiltering = textParts.map((part: any) => part.text).join(' ');
+        if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && 
+            (userContext.memories.length > 0 || userContext.notes.length > 0)) {
+          
+          fastify.log.info({
+            msg: '🔵 LEGACY CONTEXT API - Step 2: Starting Gemini Context Filtering',
+            contentForFiltering: contentForFiltering,
+            memoriesToFilter: exportData.include_memories ? userContext.memories.length : 0,
+            notesToFilter: exportData.include_notes ? userContext.notes.length : 0
+          });
+
+          const memoriesToFilter = exportData.include_memories ? userContext.memories : [];
+          const notesToFilter = exportData.include_notes ? userContext.notes : [];
+
+          const { relevantMemories, relevantNotes } = await filterRelevantContext(
+            contentForFiltering, memoriesToFilter, notesToFilter, genAI, fastify.log
+          );
+          userContext.relevantMemories = relevantMemories;
+          userContext.relevantNotes = relevantNotes;
+
+          fastify.log.info({
+            msg: '🔵 LEGACY CONTEXT API - Step 2 Complete: Gemini Context Filtering Done',
+            relevantMemoriesCount: relevantMemories.length,
+            relevantNotesCount: relevantNotes.length,
+            relevantMemories: relevantMemories,
+            relevantNotes: relevantNotes
+          });
+        } else {
+          userContext.relevantMemories = [];
+          userContext.relevantNotes = [];
+          fastify.log.info({
+            msg: '🔵 LEGACY CONTEXT API - Step 2: Skipping Gemini Context Filtering',
+            reason: !contentForFiltering.trim() ? 'No content to filter' : 
+                    !(exportData.include_memories || exportData.include_notes) ? 'Memories/notes disabled' :
+                    !(userContext.memories.length > 0 || userContext.notes.length > 0) ? 'No memories/notes available' : 'Unknown'
+          });
+        }
+        
+        // STEP 3: Build context-aware messages with enhanced system prompt
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Step 3: Building Enhanced System Prompt',
+          baseSystemPrompt: body.system_prompt || userContext.systemPrompt,
+          willIncludeMemories: exportData.include_memories && userContext.relevantMemories && userContext.relevantMemories.length > 0,
+          willIncludeNotes: exportData.include_notes && userContext.relevantNotes && userContext.relevantNotes.length > 0
+        });
+
+        const contextAwareMessages = buildExportedContextAwareMessages(
+          userContext, 
+          [], // No session history for context API
+          body.messages, 
+          exportData,
+          body.system_prompt // Allow system prompt override
+        );
+
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Step 3 Complete: Enhanced System Prompt Built',
+          finalSystemPrompt: contextAwareMessages[0].content,
+          totalMessagesCount: contextAwareMessages.length,
+          messageTypes: contextAwareMessages.map(m => m.role)
+        });
+
+        // Prepare OpenRouter parameters
+        const openRouterParams = { ...params };
+        delete openRouterParams.model;
+        delete (openRouterParams as any).system_prompt;
+
+        // Validate max_tokens
+        if (openRouterParams.max_tokens && openRouterParams.max_tokens > modelCapabilities.maxTokens) {
+          openRouterParams.max_tokens = modelCapabilities.maxTokens;
+        }
+
+        // STEP 4: Call OpenRouter
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Step 4: Sending to OpenRouter',
+          model: modelToUse,
+          messagesCount: contextAwareMessages.length,
+          parameters: openRouterParams
+        });
+
+        const openRouterResponse = await callOpenRouter(
+          modelToUse, 
+          contextAwareMessages, 
+          openRouterApiKey, 
+          params.stream || false,
+          openRouterParams
+        );
+
+        if (params.stream) {
+          reply.raw.writeHead(200, { 
+            'Content-Type': 'text/event-stream', 
+            'Cache-Control': 'no-cache', 
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*', 
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization', 
+          });
+          
+          const reader = openRouterResponse.body?.getReader();
+          if (!reader) throw new Error("Failed to get stream reader");
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              
+              while(true) {
+                const lineEnd = buffer.indexOf('\n');
+                if (lineEnd === -1) break;
+
+                const line = buffer.slice(0, lineEnd).trim();
+                buffer = buffer.slice(lineEnd + 1);
+
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') {
+                    reply.raw.write(line + '\n\n');
+                    break; 
+                  }
+                  try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.usage) { 
+                      promptTokens = parsed.usage.prompt_tokens || promptTokens;
+                      completionTokens = parsed.usage.completion_tokens || completionTokens;
                     }
+                  } catch (e) {
+                    // Ignore parsing errors for individual chunks
+                  }
+                  reply.raw.write(line + '\n\n');
                 }
-
-                if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && (userContext.memories.length > 0 || userContext.notes.length > 0)) {
-                    const memoriesToFilter = exportData.include_memories ? userContext.memories : [];
-                    const notesToFilter = exportData.include_notes ? userContext.notes : [];
-                    const { relevantMemories, relevantNotes } = await filterRelevantContext(contentForFiltering, memoriesToFilter, notesToFilter, genAI, fastify.log);
-                    userContext.relevantMemories = relevantMemories;
-                    userContext.relevantNotes = relevantNotes;
-                } else {
-                    userContext.relevantMemories = [];
-                    userContext.relevantNotes = [];
-                }
-                
-                const allMessages = buildContextAwareMessages(userContext, sessionHistory, newMessages[newMessages.length -1], exportData);
-
-                const openRouterBody: any = { model, messages: allMessages, stream: stream || false, temperature, max_tokens, top_p, frequency_penalty, presence_penalty };
-                Object.keys(openRouterBody).forEach(key => openRouterBody[key] === undefined && delete openRouterBody[key]);
-
-                const openRouterResponse = await callOpenRouter(model, allMessages, openRouterApiKey, stream || false);
-                
-                if (stream) {
-                    reply.raw.writeHead(200, { 
-                        'Content-Type': 'text/event-stream', 
-                        'Cache-Control': 'no-cache', 
-                        'Connection': 'keep-alive',
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-                    });
-                    const reader = openRouterResponse.body?.getReader();
-                     if (!reader) throw new Error("Failed to get stream reader");
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    let fullResponseText = '';
-
-                     try {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            
-                            buffer += decoder.decode(value, { stream: true });
-                            
-                            while(true) {
-                                const lineEnd = buffer.indexOf('\n');
-                                if (lineEnd === -1) break;
-
-                                const line = buffer.slice(0, lineEnd).trim();
-                                buffer = buffer.slice(lineEnd + 1);
-
-                                if (line.startsWith('data: ')) {
-                                    const data = line.slice(6);
-                                    if (data === '[DONE]') {
-                                        reply.raw.write(line + '\n\n');
-                                        break; 
-                                    }
-                                    try {
-                                        const parsed = JSON.parse(data);
-                                        if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                                           fullResponseText += parsed.choices[0].delta.content;
-                                        }
-                                        if (parsed.usage) {
-                                            promptTokens = parsed.usage.prompt_tokens || promptTokens;
-                                            completionTokens = parsed.usage.completion_tokens || completionTokens;
-                                        }
-                                    } catch (e) {
-                                        fastify.log.warn({msg: "Error parsing stream data chunk", dataChunk: data, err: e});
-                                    }
-                                    reply.raw.write(line + '\n\n');
-                                }
-                            }
-                        }
-                    } finally {
-                        reader.releaseLock();
-                        reply.raw.end();
-                    }
-                } else {
-                    const responseData: any = await openRouterResponse.json();
-                    if (responseData.usage) {
-                        promptTokens = responseData.usage.prompt_tokens || 0;
-                        completionTokens = responseData.usage.completion_tokens || 0;
-                    }
-                    reply.code(200).send(responseData);
-                }
-                
-                const responseTimeMs = Date.now() - startTime;
-                // Corrected order: apiKey, userId, endpoint, model, supabase, logger, promptTokens, completionTokens, responseTimeMs
-                await logApiUsage(apiKey, exportData.user_id, '/api/exported/session/chat/completions', model, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
-
-            } catch (error: any) {
-                fastify.log.error({ msg: 'Session API consumption error', err: error, apiKey });
-                if (!reply.sent) reply.code(500).send({ error: error.message });
-                else if (!reply.raw.writableEnded) reply.raw.end();
+              }
             }
+          } finally {
+            reader.releaseLock();
+            reply.raw.end();
+          }
+        } else {
+          const responseData: any = await openRouterResponse.json();
+          if (responseData.usage) {
+            promptTokens = responseData.usage.prompt_tokens || 0;
+            completionTokens = responseData.usage.completion_tokens || 0;
+          }
+          reply.code(200).send(responseData);
         }
-    );
+        
+        const responseTimeMs = Date.now() - startTime;
+        await logApiUsage(apiKey, exportData.user_id, '/api/exported/context/chat/completions', modelToUse, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
+
+        fastify.log.info({
+          msg: '🔵 LEGACY CONTEXT API - Request Complete',
+          responseTimeMs,
+          promptTokens,
+          completionTokens
+        });
+
+      } catch (error: any) {
+        fastify.log.error({ msg: '🔵 LEGACY CONTEXT API - Error', err: error, apiKey });
+        if (!reply.sent) {
+          reply.code(500).send({
+            error: {
+              message: error.message || 'Internal server error',
+              type: 'api_error',
+              code: 'internal_error'
+            }
+          });
+        } else if (!reply.raw.writableEnded) {
+          reply.raw.end();
+        }
+      }
+    }
+  );
+
+  // Enhanced legacy session API endpoint - ALWAYS includes session history + context filtering
+  fastify.post(
+    '/api/exported/session/:apiKey/chat/completions',
+    async (request: FastifyRequest<{ Params: LegacyChatCompletionsParams, Body: LegacyChatCompletionsBody }>, reply: FastifyReply) => {
+      const { apiKey } = request.params;
+      const body = request.body;
+      const startTime = Date.now();
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let exportData: any = null;
+
+      try {
+        exportData = await verifyExportedApiKey(apiKey, 'session', supabase, fastify.log);
+
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Request Started',
+          apiKeyId: exportData.id,
+          userId: exportData.user_id,
+          sessionId: exportData.session_id,
+          model: body.model || exportData.base_model,
+          includeMemories: exportData.include_memories,
+          includeNotes: exportData.include_notes,
+          thirdPartySystemPrompt: body.system_prompt ? 'PROVIDED' : 'NOT_PROVIDED'
+        });
+
+        if (!exportData.session_id) {
+          return reply.code(400).send({
+            error: {
+              message: 'API key is not configured for a specific session.',
+              type: 'invalid_request_error',
+              code: 'session_not_configured'
+            }
+          });
+        }
+
+        // Extract and validate parameters
+        const params = extractOpenAIParameters(body);
+        const modelToUse = params.model || exportData.base_model;
+
+        if (!exportData.allowed_models || !exportData.allowed_models.includes(modelToUse)) {
+          return reply.code(403).send({
+            error: {
+              message: `Model '${modelToUse}' not allowed for this API key`,
+              type: 'invalid_request_error',
+              code: 'model_not_allowed'
+            }
+          });
+        }
+
+        // Get model capabilities
+        const modelCapabilities = getModelCapabilities(modelToUse);
+
+        // STEP 1: ALWAYS get session history for session API - this is the core feature
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 1: Getting Session History',
+          sessionId: exportData.session_id,
+          userId: exportData.user_id
+        });
+
+        const { data: sessionHistoryData, error: historyError } = await supabase
+          .from('chat_history')
+          .select('content, role, created_at')
+          .eq('session_id', exportData.session_id)
+          .eq('user_id', exportData.user_id)
+          .order('created_at', { ascending: true });
+        
+        if (historyError) {
+          fastify.log.error({
+            msg: '🟡 LEGACY SESSION API - Step 1 Error: Failed to get session history',
+            error: historyError,
+            sessionId: exportData.session_id
+          });
+          throw historyError;
+        }
+
+        const sessionHistory = (sessionHistoryData || []).map((msg: any) => ({ 
+          role: msg.role, 
+          content: msg.content,
+          created_at: msg.created_at
+        }));
+
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 1 Complete: Session History Retrieved',
+          sessionHistoryCount: sessionHistory.length,
+          sessionHistory: sessionHistory.map((msg, idx) => ({
+            index: idx + 1,
+            role: msg.role,
+            content: msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : ''),
+            created_at: msg.created_at
+          }))
+        });
+
+        // STEP 2: Get user context
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 2: Getting User Context',
+          userId: exportData.user_id
+        });
+        const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 2 Complete: User Context Retrieved',
+          memoriesCount: userContext.memories.length,
+          notesCount: userContext.notes.length,
+          userSystemPrompt: userContext.systemPrompt
+        });
+
+        // STEP 3: Filter relevant context if enabled and there's content to filter
+        let contentForFiltering = '';
+        const lastMessage = body.messages[body.messages.length - 1];
+        if (lastMessage?.content) {
+          contentForFiltering = processMessageContent(lastMessage.content);
+        }
+
+        if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && 
+            (userContext.memories.length > 0 || userContext.notes.length > 0)) {
+          
+          fastify.log.info({
+            msg: '🟡 LEGACY SESSION API - Step 3: Starting Gemini Context Filtering',
+            contentForFiltering: contentForFiltering,
+            memoriesToFilter: exportData.include_memories ? userContext.memories.length : 0,
+            notesToFilter: exportData.include_notes ? userContext.notes.length : 0
+          });
+
+          const memoriesToFilter = exportData.include_memories ? userContext.memories : [];
+          const notesToFilter = exportData.include_notes ? userContext.notes : [];
+
+          const { relevantMemories, relevantNotes } = await filterRelevantContext(
+            contentForFiltering, memoriesToFilter, notesToFilter, genAI, fastify.log
+          );
+          userContext.relevantMemories = relevantMemories;
+          userContext.relevantNotes = relevantNotes;
+
+          fastify.log.info({
+            msg: '🟡 LEGACY SESSION API - Step 3 Complete: Gemini Context Filtering Done',
+            relevantMemoriesCount: relevantMemories.length,
+            relevantNotesCount: relevantNotes.length,
+            relevantMemories: relevantMemories,
+            relevantNotes: relevantNotes
+          });
+        } else {
+          userContext.relevantMemories = [];
+          userContext.relevantNotes = [];
+          fastify.log.info({
+            msg: '🟡 LEGACY SESSION API - Step 3: Skipping Gemini Context Filtering',
+            reason: !contentForFiltering.trim() ? 'No content to filter' : 
+                    !(exportData.include_memories || exportData.include_notes) ? 'Memories/notes disabled' :
+                    !(userContext.memories.length > 0 || userContext.notes.length > 0) ? 'No memories/notes available' : 'Unknown'
+          });
+        }
+        
+        // STEP 4: Build session-aware messages with enhanced system prompt that includes session history and user context
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 4: Building Enhanced System Prompt with Session History',
+          baseSystemPrompt: body.system_prompt || userContext.systemPrompt,
+          sessionHistoryCount: sessionHistory.length,
+          willIncludeMemories: exportData.include_memories && userContext.relevantMemories && userContext.relevantMemories.length > 0,
+          willIncludeNotes: exportData.include_notes && userContext.relevantNotes && userContext.relevantNotes.length > 0
+        });
+
+        const sessionAwareMessages = buildExportedSessionAwareMessages(
+          userContext, 
+          sessionHistory, // ALWAYS include full session history
+          body.messages, // Third-party app's new messages
+          exportData,
+          body.system_prompt // Allow system prompt override
+        );
+
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 4 Complete: Enhanced System Prompt with Session History Built',
+          finalSystemPrompt: sessionAwareMessages[0].content,
+          totalMessagesCount: sessionAwareMessages.length,
+          messageTypes: sessionAwareMessages.map(m => m.role),
+          sessionHistoryIncluded: sessionHistory.length
+        });
+
+        // Prepare OpenRouter parameters
+        const openRouterParams = { ...params };
+        delete openRouterParams.model;
+        delete (openRouterParams as any).system_prompt;
+
+        // Validate max_tokens
+        if (openRouterParams.max_tokens && openRouterParams.max_tokens > modelCapabilities.maxTokens) {
+          openRouterParams.max_tokens = modelCapabilities.maxTokens;
+        }
+
+        // STEP 5: Call OpenRouter
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Step 5: Sending to OpenRouter',
+          model: modelToUse,
+          messagesCount: sessionAwareMessages.length,
+          parameters: openRouterParams
+        });
+
+        const openRouterResponse = await callOpenRouter(
+          modelToUse, 
+          sessionAwareMessages, 
+          openRouterApiKey, 
+          params.stream || false,
+          openRouterParams
+        );
+        
+        if (params.stream) {
+          reply.raw.writeHead(200, { 
+            'Content-Type': 'text/event-stream', 
+            'Cache-Control': 'no-cache', 
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          });
+          
+          const reader = openRouterResponse.body?.getReader();
+          if (!reader) throw new Error("Failed to get stream reader");
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              
+              buffer += decoder.decode(value, { stream: true });
+              
+              while(true) {
+                const lineEnd = buffer.indexOf('\n');
+                if (lineEnd === -1) break;
+
+                const line = buffer.slice(0, lineEnd).trim();
+                buffer = buffer.slice(lineEnd + 1);
+
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') {
+                    reply.raw.write(line + '\n\n');
+                    break; 
+                  }
+                  try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.usage) {
+                      promptTokens = parsed.usage.prompt_tokens || promptTokens;
+                      completionTokens = parsed.usage.completion_tokens || completionTokens;
+                    }
+                  } catch (e) {
+                    // Ignore parsing errors for individual chunks
+                  }
+                  reply.raw.write(line + '\n\n');
+                }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+            reply.raw.end();
+          }
+        } else {
+          const responseData: any = await openRouterResponse.json();
+          if (responseData.usage) {
+            promptTokens = responseData.usage.prompt_tokens || 0;
+            completionTokens = responseData.usage.completion_tokens || 0;
+          }
+          reply.code(200).send(responseData);
+        }
+        
+        const responseTimeMs = Date.now() - startTime;
+        await logApiUsage(apiKey, exportData.user_id, '/api/exported/session/chat/completions', modelToUse, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
+
+        fastify.log.info({
+          msg: '🟡 LEGACY SESSION API - Request Complete',
+          responseTimeMs,
+          promptTokens,
+          completionTokens,
+          sessionId: exportData.session_id
+        });
+
+      } catch (error: any) {
+        fastify.log.error({ 
+          msg: '🟡 LEGACY SESSION API - Error', 
+          err: error, 
+          apiKey, 
+          sessionId: exportData?.session_id 
+        });
+        if (!reply.sent) {
+          reply.code(500).send({
+            error: {
+              message: error.message || 'Internal server error',
+              type: 'api_error',
+              code: 'internal_error'
+            }
+          });
+        } else if (!reply.raw.writableEnded) {
+          reply.raw.end();
+        }
+      }
+    }
+  );
 }

@@ -2,30 +2,55 @@ import { fetch } from 'undici';
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { FastifyBaseLogger } from 'fastify';
 
-// Helper function to call OpenRouter API
+// Enhanced OpenRouter API call with full parameter support
 export async function callOpenRouter(
   model: string,
   messages: any[],
   openRouterApiKey: string,
   stream: boolean = false,
-  tools?: any[]
+  additionalParams?: {
+    temperature?: number;
+    max_tokens?: number;
+    top_p?: number;
+    top_k?: number;
+    frequency_penalty?: number;
+    presence_penalty?: number;
+    repetition_penalty?: number;
+    min_p?: number;
+    stop?: string | string[];
+    reasoning?: boolean;
+    include_reasoning?: boolean;
+    tools?: any[];
+    tool_choice?: any;
+    response_format?: any;
+    structured_outputs?: boolean;
+    logit_bias?: Record<string, number>;
+    logprobs?: boolean;
+    top_logprobs?: number;
+    seed?: number;
+  }
 ) {
   const headers = {
     'Authorization': `Bearer ${openRouterApiKey}`,
     'Content-Type': 'application/json',
-    'HTTP-Referer': process.env.SITE_URL || 'https://your-site-url.com', // Use env var or default
-    'X-Title': process.env.APP_NAME || 'Fast Backend AI App', // Use env var or default
+    'HTTP-Referer': process.env.SITE_URL || 'https://your-site-url.com',
+    'X-Title': process.env.APP_NAME || 'Fast Backend AI App',
   };
 
   const body: any = {
     model,
     messages,
     stream,
-    // Add usage tracking for OpenRouter
-    usage: { include: true }
+    stream_options: { include_usage: true }, // Always include usage for token tracking
   };
-  if (tools && tools.length > 0) { // Ensure tools is not an empty array if not needed
-    body.tools = tools;
+
+  // Add all additional parameters if provided
+  if (additionalParams) {
+    Object.entries(additionalParams).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        body[key] = value;
+      }
+    });
   }
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -40,7 +65,6 @@ export async function callOpenRouter(
     try {
         errorData = JSON.parse(errorText);
     } catch (e) {
-        // If parsing fails, use the raw text or a generic message
         errorData.details = errorText;
     }
     throw new Error(errorData.error?.message || errorData.message || `OpenRouter API error: ${response.status}`);
@@ -235,4 +259,47 @@ Respond with ONLY the title, no quotes or additional text.`
     logger.error({ msg: 'Title generation failed:', err: error });
     return 'New Conversation';
   }
+}
+
+// Helper function to detect model capabilities
+export function getModelCapabilities(modelId: string) {
+  const capabilities = {
+    supportsReasoning: false,
+    supportsTools: true,
+    supportsImages: false,
+    isReasoningModel: false,
+    maxTokens: 4096,
+    contextWindow: 128000,
+  };
+
+  // DeepSeek R1 models
+  if (modelId.includes('deepseek') && modelId.includes('r1')) {
+    capabilities.supportsReasoning = true;
+    capabilities.isReasoningModel = true;
+    capabilities.maxTokens = 32768;
+    capabilities.contextWindow = 131072;
+  }
+
+  // Claude models
+  if (modelId.includes('claude')) {
+    capabilities.supportsImages = true;
+    capabilities.maxTokens = 32000;
+    capabilities.contextWindow = 200000;
+  }
+
+  // GPT models
+  if (modelId.includes('gpt')) {
+    capabilities.supportsImages = modelId.includes('gpt-4');
+    capabilities.maxTokens = 16384;
+    capabilities.contextWindow = 128000;
+  }
+
+  // Gemini models
+  if (modelId.includes('gemini')) {
+    capabilities.supportsImages = true;
+    capabilities.maxTokens = 8192;
+    capabilities.contextWindow = 1048576;
+  }
+
+  return capabilities;
 }

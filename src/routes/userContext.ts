@@ -95,4 +95,25 @@ export default async function userContextRoutes(fastify: FastifyInstance, option
       reply.code(500).send({ error: error.message });
     }
   });
+
+  // Add this missing GET endpoint
+fastify.get('/system-prompt', async (request: FastifyRequest, reply: FastifyReply) => {
+  const userId = request.user.id;
+  try {
+    const { data, error } = await supabase
+      .from('system_prompts')
+      .select('prompt')
+      .eq('user_id', userId)
+      .single();
+    
+    if (error && error.code !== 'PGRST116') throw error; // PGRST116 = no rows found
+    
+    reply.code(200).send({ 
+      prompt: data?.prompt || 'You are a helpful AI assistant.' 
+    });
+  } catch (error: any) {
+    fastify.log.error({ msg: 'Error fetching system prompt', err: error, userId });
+    reply.code(500).send({ error: error.message });
+  }
+});
 }
