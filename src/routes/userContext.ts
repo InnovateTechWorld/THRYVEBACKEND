@@ -1,0 +1,98 @@
+import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { SupabaseClient } from '@supabase/supabase-js';
+
+export default async function userContextRoutes(fastify: FastifyInstance, options: { supabase: SupabaseClient }) {
+  const { supabase } = options;
+
+  // User Memory Management
+  fastify.post('/memory', async (request: FastifyRequest<{ Body: { content: string } }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const { content } = request.body;
+    try {
+      const { data, error } = await supabase.from('memory').insert([{ user_id: userId, content }]).select();
+      if (error) throw error;
+      reply.code(201).send(data);
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error creating memory', err: error, userId });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  fastify.get('/memory', async (request: FastifyRequest, reply: FastifyReply) => {
+    const userId = request.user.id;
+    try {
+      const { data, error } = await supabase.from('memory').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+      if (error) throw error;
+      reply.code(200).send(data);
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error fetching memory', err: error, userId });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  fastify.delete('/memory/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const { id } = request.params;
+    try {
+      const { error } = await supabase.from('memory').delete().eq('id', id).eq('user_id', userId);
+      if (error) throw error;
+      reply.code(204).send();
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error deleting memory', err: error, userId, memoryId: id });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  // User Notes Management
+  fastify.post('/notes', async (request: FastifyRequest<{ Body: { content: string } }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const { content } = request.body;
+    try {
+      const { data, error } = await supabase.from('notes').insert([{ user_id: userId, content }]).select();
+      if (error) throw error;
+      reply.code(201).send(data);
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error creating note', err: error, userId });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  fastify.get('/notes', async (request: FastifyRequest, reply: FastifyReply) => {
+    const userId = request.user.id;
+    try {
+      const { data, error } = await supabase.from('notes').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+      if (error) throw error;
+      reply.code(200).send(data);
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error fetching notes', err: error, userId });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  fastify.delete('/notes/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const { id } = request.params;
+    try {
+      const { error } = await supabase.from('notes').delete().eq('id', id).eq('user_id', userId);
+      if (error) throw error;
+      reply.code(204).send();
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error deleting note', err: error, userId, noteId: id });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+
+  // System Prompt Management
+  fastify.patch('/system-prompt', async (request: FastifyRequest<{ Body: { prompt: string } }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const { prompt } = request.body;
+    try {
+      const { data, error } = await supabase.from('system_prompts').upsert({ user_id: userId, prompt }, { onConflict: 'user_id' }).select();
+      if (error) throw error;
+      reply.code(200).send(data);
+    } catch (error: any) {
+      fastify.log.error({ msg: 'Error updating system prompt', err: error, userId });
+      reply.code(500).send({ error: error.message });
+    }
+  });
+}

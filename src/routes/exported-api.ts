@@ -1,479 +1,324 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { createClient } from '@supabase/supabase-js';
-import { EncryptionUtils } from '../utils/encryption';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { verifyExportedApiKey, logApiUsage, ExportedApiData } from '../lib/apiUtils';
+import { getUserContext, buildContextAwareMessages, UserContextData } from '../lib/context';
+import { callOpenRouter, filterRelevantContext } from '../lib/ai';
+import { EncryptionUtils } from '../utils/encryption'; // Import EncryptionUtils
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
-
-// OpenAI-compatible request/response types
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
-  name?: string;
-  tool_call_id?: string;
+// Define a type for the request user after API key verification
+interface AuthenticatedRequest extends FastifyRequest {
+  exportedApiData?: ExportedApiData; // To store verified API key data
 }
 
-interface ChatCompletionRequest {
-  model: string;
-  messages: ChatMessage[];
-  max_tokens?: number;
-  temperature?: number;
-  top_p?: number;
+interface ExportedChatCompletionsBody {
+  model?: string; 
+  messages: any[];
   stream?: boolean;
-  stop?: string | string[];
-  presence_penalty?: number;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
   frequency_penalty?: number;
-  logit_bias?: Record<string, number>;
-  user?: string;
-  tools?: any[];
-  tool_choice?: any;
+  presence_penalty?: number;
 }
 
-export async function exportedApiRoutes(fastify: FastifyInstance) {
-  // Middleware to validate exported API key and get associated data
-  async function validateExportedApiKey(request: FastifyRequest, reply: FastifyReply) {
-    const authHeader = request.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return reply.status(401).send({ error: 'Missing or invalid authorization header' });
+export async function exportedApiRoutes(
+    fastify: FastifyInstance, 
+    options: { 
+        supabase: SupabaseClient, 
+        genAI: GoogleGenerativeAI, 
+        openRouterApiKey: string 
     }
+) {
+  const { supabase, genAI, openRouterApiKey } = options;
 
-    const apiKey = authHeader.substring(7);
-    const hashedKey = EncryptionUtils.hashApiKey(apiKey);
-
-    const { data: exportedApi, error } = await supabase
-      .from('exported_apis')
-      .select(`
-        *,
-        users (id, email)
-      `)
-      .eq('api_key_hash', hashedKey)
-      .eq('is_active', true)
-      .single();
-
-    if (error || !exportedApi) {
-      return reply.status(401).send({ error: 'Invalid API key' });
+  fastify.addHook('preHandler', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+    const apiKeyHeader = request.headers.authorization;
+    if (!apiKeyHeader || !apiKeyHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({ error: 'Missing or invalid API key. Use Bearer token format.' });
     }
+    const apiKey = apiKeyHeader.split(' ')[1];
 
-    // Check if API key is expired
-    if (exportedApi.expires_at && new Date(exportedApi.expires_at) < new Date()) {
-      return reply.status(401).send({ error: 'API key expired' });
+    let expectedType: 'context' | 'session' = 'context';
+    if (request.url.includes('/session/v1/')) { // Use request.url
+      expectedType = 'session';
     }
-
-    // Rate limiting check
-    const { data: rateLimitData } = await supabase
-      .from('rate_limits')
-      .select('*')
-      .eq('api_key_hash', hashedKey)
-      .gte('window_start', new Date(Date.now() - 60000)) // Last minute
-      .single();
-
-    if (rateLimitData && rateLimitData.request_count >= exportedApi.rate_limit) {
-      return reply.status(429).send({ error: 'Rate limit exceeded' });
-    }
-
-    // Update rate limiting
-    await supabase
-      .from('rate_limits')
-      .upsert({
-        api_key_hash: hashedKey,
-        window_start: new Date(),
-        request_count: (rateLimitData?.request_count || 0) + 1
-      });
-
-    (request as any).exportedApi = exportedApi;
-    (request as any).userId = exportedApi.user_id;
-  }
-
-  // Get user context (memory, notes, system prompt) based on API configuration
-  async function getUserContext(userId: string, exportedApi: any) {
-    // Always get system prompt
-    const { data: promptData } = await supabase
-      .from('system_prompts')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
-
-    let memory: any[] = [];
-    let notes: any[] = [];
-
-    // Only fetch memory if API is configured to include it
-    if (exportedApi.include_memories) {
-      const { data: memoryData } = await supabase
-        .from('memory')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
-      
-      memory = memoryData || [];
-    }
-
-    // Only fetch notes if API is configured to include them
-    if (exportedApi.include_notes) {
-      const { data: notesData } = await supabase
-        .from('notes')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
-      
-      notes = notesData || [];
-    }
-
-    return {
-      memory,
-      notes,
-      systemPrompt: promptData?.prompt || "You are a helpful AI assistant."
-    };
-  }
-
-  // Determine which model to use based on request and API configuration
-  function determineModel(requestModel: string, exportedApi: any): string {
-    // If model is "base" or matches the API's base model, use the API's default model
-    if (requestModel === 'base' || requestModel === exportedApi.base_model) {
-      return exportedApi.base_model || 'openai/gpt-4';
-    }
-
-    // If API has allowed models and request model is in the list, use it
-    if (exportedApi.allowed_models && exportedApi.allowed_models.length > 0) {
-      if (exportedApi.allowed_models.includes(requestModel)) {
-        return requestModel;
-      } else {
-        throw new Error(`Model ${requestModel} not allowed for this API. Allowed models: ${exportedApi.allowed_models.join(', ')}`);
-      }
-    }
-
-    // If no restrictions, allow any model
-    return requestModel;
-  }
-
-  // Context-based chat completions endpoint
-  fastify.post<{
-    Body: ChatCompletionRequest;
-  }>('/api/exported/context/v1/chat/completions', {
-    preHandler: validateExportedApiKey
-  }, async (request, reply) => {
-    try {
-      const { messages, model: requestModel, stream = false, ...otherParams } = request.body;
-      const exportedApi = (request as any).exportedApi;
-      const userId = (request as any).userId;
-
-      // Determine which model to use
-      let modelToUse: string;
-      try {
-        modelToUse = determineModel(requestModel, exportedApi);
-      } catch (error) {
-        return reply.status(400).send({ error: (error as Error).message });
-      }
-
-      // Get user context based on API configuration
-      const context = await getUserContext(userId, exportedApi);
-
-      // Build context-aware system message
-      let contextMessage = context.systemPrompt;
-      
-      if (context.memory.length > 0) {
-        contextMessage += '\n\nRelevant memories about the user:\n';
-        contextMessage += context.memory.slice(0, 10).map(m => `- ${m.content}`).join('\n');
-      }
-
-      if (context.notes.length > 0) {
-        contextMessage += '\n\nUser notes:\n';
-        contextMessage += context.notes.slice(0, 5).map(n => `- ${n.content}`).join('\n');
-      }
-
-      // Prepare messages with context
-      const contextMessages: ChatMessage[] = [
-        { role: 'system', content: contextMessage },
-        ...messages
-      ];
-
-      // Call OpenRouter API
-      const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
-          'X-Title': 'Fast Backend API'
-        },
-        body: JSON.stringify({
-          model: modelToUse,
-          messages: contextMessages,
-          stream,
-          ...otherParams
-        })
-      });
-
-      if (!openRouterResponse.ok) {
-        const error = await openRouterResponse.text();
-        return reply.status(openRouterResponse.status).send({ error });
-      }
-
-      const hashedKey = EncryptionUtils.hashApiKey(request.headers.authorization!.substring(7));
-
-      // Log API usage
-      await supabase.from('api_usage').insert({
-        api_key_hash: hashedKey,
-        user_id: userId,
-        model_used: modelToUse,
-        prompt_tokens: 0, // Will be updated from response
-        completion_tokens: 0,
-        total_tokens: 0,
-        request_type: 'context_chat'
-      });
-
-      if (stream) {
-        // Handle streaming response
-        reply.raw.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*'
-        });
-
-        const reader = openRouterResponse.body?.getReader();
-        if (!reader) {
-          return reply.status(500).send({ error: 'Failed to read stream' });
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = '';
-
+    
+    if (request.url.includes('/models')) {
         try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (line.trim() === '') continue;
-              reply.raw.write(line + '\n');
-            }
-          }
-
-          if (buffer.trim()) {
-            reply.raw.write(buffer + '\n');
-          }
-        } finally {
-          reply.raw.end();
+            const hashedKey = EncryptionUtils.hashApiKey(apiKey); // Use imported EncryptionUtils
+            const { data, error } = await supabase
+              .from('exported_apis')
+              .select('*')
+              .eq('api_key_hash', hashedKey)
+              .eq('is_active', true)
+              .single();
+            if (error || !data) throw new Error('Invalid or inactive API key for models endpoint.');
+            request.exportedApiData = data as ExportedApiData;
+        } catch (error: any) {
+            fastify.log.warn({ msg: 'API Key verification failed for /models endpoint', err: error.message });
+            return reply.code(403).send({ error: `API Key verification failed: ${error.message}` });
         }
-      } else {
-        // Handle non-streaming response
-        const responseData = await openRouterResponse.json();
-        
-        // Update usage tracking
-        if (responseData.usage) {
-          await supabase
-            .from('api_usage')
-            .update({
-              prompt_tokens: responseData.usage.prompt_tokens,
-              completion_tokens: responseData.usage.completion_tokens,
-              total_tokens: responseData.usage.total_tokens
-            })
-            .eq('api_key_hash', hashedKey)
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1);
+    } else {
+        try {
+            request.exportedApiData = await verifyExportedApiKey(apiKey, expectedType, supabase, fastify.log);
+        } catch (error: any) {
+            fastify.log.warn({ msg: 'API Key verification failed in exported-api preHandler', err: error.message });
+            return reply.code(403).send({ error: `API Key verification failed: ${error.message}` });
         }
-
-        return reply.send(responseData);
-      }
-    } catch (error) {
-      console.error('Context API Error:', error);
-      return reply.status(500).send({ error: 'Internal server error' });
     }
   });
 
-  // Session-based chat completions endpoint
-  fastify.post<{
-    Body: ChatCompletionRequest & { session_id?: string };
-  }>('/api/exported/session/v1/chat/completions', {
-    preHandler: validateExportedApiKey
-  }, async (request, reply) => {
-    try {
-      const { messages, model: requestModel, session_id, stream = false, ...otherParams } = request.body;
-      const exportedApi = (request as any).exportedApi;
-      const userId = (request as any).userId;
+  fastify.post(
+    '/api/exported/context/v1/chat/completions',
+    async (request: AuthenticatedRequest, reply: FastifyReply) => {
+      const { messages, stream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty } = request.body as ExportedChatCompletionsBody;
+      const exportData = request.exportedApiData!; 
+      const modelToUse = (request.body as ExportedChatCompletionsBody).model || exportData.base_model;
+      const apiKey = request.headers.authorization!.split(' ')[1]; 
+      const startTime = Date.now();
+      let promptTokens = 0;
+      let completionTokens = 0;
 
-      // Determine which model to use
-      let modelToUse: string;
       try {
-        modelToUse = determineModel(requestModel, exportedApi);
-      } catch (error) {
-        return reply.status(400).send({ error: (error as Error).message });
+        if (!exportData.allowed_models || !exportData.allowed_models.includes(modelToUse)) {
+          return reply.code(403).send({ error: `Model '${modelToUse}' not allowed for this API key.` });
+        }
+
+        const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
+        let contentForFiltering = '';
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.content) {
+          if (typeof lastMessage.content === 'string') contentForFiltering = lastMessage.content;
+          else if (Array.isArray(lastMessage.content)) {
+            const textParts = lastMessage.content.filter((part: any) => part.type === 'text');
+            contentForFiltering = textParts.map((part: any) => part.text).join(' ');
+          }
+        }
+
+        if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && (userContext.memories.length > 0 || userContext.notes.length > 0)) {
+            const memoriesToFilter = exportData.include_memories ? userContext.memories : [];
+            const notesToFilter = exportData.include_notes ? userContext.notes : [];
+            const { relevantMemories, relevantNotes } = await filterRelevantContext(contentForFiltering, memoriesToFilter, notesToFilter, genAI, fastify.log);
+            userContext.relevantMemories = relevantMemories;
+            userContext.relevantNotes = relevantNotes;
+        } else {
+            userContext.relevantMemories = [];
+            userContext.relevantNotes = [];
+        }
+
+        const contextAwareMessages = buildContextAwareMessages(userContext, [], messages, exportData);
+        const openRouterBody: any = { model: modelToUse, messages: contextAwareMessages, stream: stream || false, temperature, max_tokens, top_p, frequency_penalty, presence_penalty };
+        Object.keys(openRouterBody).forEach(key => openRouterBody[key] === undefined && delete openRouterBody[key]);
+
+        const openRouterResponse = await callOpenRouter(modelToUse, contextAwareMessages, openRouterApiKey, stream || false);
+
+        if (stream) {
+          reply.raw.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          });
+          const reader = openRouterResponse.body?.getReader();
+          if (!reader) throw new Error("Failed to get stream reader");
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              while (true) {
+                const lineEnd = buffer.indexOf('\n');
+                if (lineEnd === -1) break;
+                const line = buffer.slice(0, lineEnd).trim();
+                buffer = buffer.slice(lineEnd + 1);
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') {
+                    reply.raw.write(line + '\n\n');
+                    break;
+                  }
+                  try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.usage) {
+                      promptTokens = parsed.usage.prompt_tokens || promptTokens;
+                      completionTokens = parsed.usage.completion_tokens || completionTokens;
+                    }
+                  } catch (e) { /* ignore */ }
+                  reply.raw.write(line + '\n\n');
+                }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+            reply.raw.end();
+          }
+        } else {
+          const responseData: any = await openRouterResponse.json();
+          if (responseData.usage) {
+            promptTokens = responseData.usage.prompt_tokens || 0;
+            completionTokens = responseData.usage.completion_tokens || 0;
+          }
+          reply.code(200).send(responseData);
+        }
+        const responseTimeMs = Date.now() - startTime;
+        await logApiUsage(apiKey, exportData.user_id, request.url, modelToUse, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
+
+      } catch (error: any) {
+        fastify.log.error({ msg: 'Exported Context API (v1) consumption error', err: error.message, apiKeyId: exportData?.id }); // Added optional chaining for exportData
+        if (!reply.sent) reply.code(500).send({ error: error.message });
+        else if (!reply.raw.writableEnded) reply.raw.end();
       }
+    }
+  );
 
-      let sessionMessages = messages;
+  fastify.post(
+    '/api/exported/session/v1/chat/completions',
+    async (request: AuthenticatedRequest, reply: FastifyReply) => {
+      const { messages, stream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty } = request.body as ExportedChatCompletionsBody;
+      const exportData = request.exportedApiData!;
+      const modelToUse = (request.body as ExportedChatCompletionsBody).model || exportData.base_model;
+      const apiKey = request.headers.authorization!.split(' ')[1];
+      const startTime = Date.now();
+      let promptTokens = 0;
+      let completionTokens = 0;
 
-      // If session_id is provided and API is session-based, get session history
-      if (session_id && exportedApi.export_type === 'session') {
-        const { data: sessionHistory } = await supabase
+      try {
+        if (!exportData.session_id) {
+          return reply.code(400).send({ error: 'API key is not configured for a specific session.' });
+        }
+        if (!exportData.allowed_models || !exportData.allowed_models.includes(modelToUse)) {
+          return reply.code(403).send({ error: `Model '${modelToUse}' not allowed for this API key.` });
+        }
+
+        const { data: sessionHistoryData, error: historyError } = await supabase
           .from('chat_history')
-          .select('*')
-          .eq('session_id', exportedApi.session_id)
-          .eq('user_id', userId)
+          .select('content, role')
+          .eq('session_id', exportData.session_id)
+          .eq('user_id', exportData.user_id)
           .order('created_at', { ascending: true });
+        if (historyError) throw historyError;
+        const sessionHistory = (sessionHistoryData || []).map((msg: any) => ({ role: msg.role, content: msg.content }));
 
-        if (sessionHistory && sessionHistory.length > 0) {
-          // Convert session history to chat messages
-          const historyMessages: ChatMessage[] = sessionHistory.map(h => ({
-            role: h.role as 'user' | 'assistant',
-            content: h.content
-          }));
-
-          // Combine history with new messages
-          sessionMessages = [...historyMessages, ...messages];
-        }
-      }
-
-      // Call OpenRouter API
-      const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
-          'X-Title': 'Fast Backend API'
-        },
-        body: JSON.stringify({
-          model: modelToUse,
-          messages: sessionMessages,
-          stream,
-          ...otherParams
-        })
-      });
-
-      if (!openRouterResponse.ok) {
-        const error = await openRouterResponse.text();
-        return reply.status(openRouterResponse.status).send({ error });
-      }
-
-      const hashedKey = EncryptionUtils.hashApiKey(request.headers.authorization!.substring(7));
-
-      // Log API usage
-      await supabase.from('api_usage').insert({
-        api_key_hash: hashedKey,
-        user_id: userId,
-        model_used: modelToUse,
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        request_type: 'session_chat'
-      });
-
-      if (stream) {
-        // Handle streaming response
-        reply.raw.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*'
-        });
-
-        const reader = openRouterResponse.body?.getReader();
-        if (!reader) {
-          return reply.status(500).send({ error: 'Failed to read stream' });
+        const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
+        let contentForFiltering = '';
+        const lastMessage = messages[messages.length - 1];
+         if (lastMessage && lastMessage.content) {
+          if (typeof lastMessage.content === 'string') contentForFiltering = lastMessage.content;
+          else if (Array.isArray(lastMessage.content)) {
+            const textParts = lastMessage.content.filter((part: any) => part.type === 'text');
+            contentForFiltering = textParts.map((part: any) => part.text).join(' ');
+          }
         }
 
-        const decoder = new TextDecoder();
-        let buffer = '';
+        if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && (userContext.memories.length > 0 || userContext.notes.length > 0)) {
+            const memoriesToFilter = exportData.include_memories ? userContext.memories : [];
+            const notesToFilter = exportData.include_notes ? userContext.notes : [];
+            const { relevantMemories, relevantNotes } = await filterRelevantContext(contentForFiltering, memoriesToFilter, notesToFilter, genAI, fastify.log);
+            userContext.relevantMemories = relevantMemories;
+            userContext.relevantNotes = relevantNotes;
+        } else {
+            userContext.relevantMemories = [];
+            userContext.relevantNotes = [];
+        }
 
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+        const allMessages = buildContextAwareMessages(userContext, sessionHistory, messages[messages.length - 1], exportData);
+        const openRouterBody: any = { model: modelToUse, messages: allMessages, stream: stream || false, temperature, max_tokens, top_p, frequency_penalty, presence_penalty };
+        Object.keys(openRouterBody).forEach(key => openRouterBody[key] === undefined && delete openRouterBody[key]);
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
+        const openRouterResponse = await callOpenRouter(modelToUse, allMessages, openRouterApiKey, stream || false);
 
-            for (const line of lines) {
-              if (line.trim() === '') continue;
-              reply.raw.write(line + '\n');
+        if (stream) {
+          reply.raw.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          });
+          const reader = openRouterResponse.body?.getReader();
+          if (!reader) throw new Error("Failed to get stream reader");
+          const decoder = new TextDecoder();
+          let buffer = '';
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              while (true) {
+                const lineEnd = buffer.indexOf('\n');
+                if (lineEnd === -1) break;
+                const line = buffer.slice(0, lineEnd).trim();
+                buffer = buffer.slice(lineEnd + 1);
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') {
+                    reply.raw.write(line + '\n\n');
+                    break;
+                  }
+                  try {
+                    const parsed = JSON.parse(data);
+                     if (parsed.usage) {
+                      promptTokens = parsed.usage.prompt_tokens || promptTokens;
+                      completionTokens = parsed.usage.completion_tokens || completionTokens;
+                    }
+                  } catch (e) { /* ignore */ }
+                  reply.raw.write(line + '\n\n');
+                }
+              }
             }
+          } finally {
+            reader.releaseLock();
+            reply.raw.end();
           }
-
-          if (buffer.trim()) {
-            reply.raw.write(buffer + '\n');
+        } else {
+          const responseData: any = await openRouterResponse.json();
+          if (responseData.usage) {
+            promptTokens = responseData.usage.prompt_tokens || 0;
+            completionTokens = responseData.usage.completion_tokens || 0;
           }
-        } finally {
-          reply.raw.end();
+          reply.code(200).send(responseData);
         }
-      } else {
-        // Handle non-streaming response
-        const responseData = await openRouterResponse.json();
-        
-        // Update usage tracking
-        if (responseData.usage) {
-          await supabase
-            .from('api_usage')
-            .update({
-              prompt_tokens: responseData.usage.prompt_tokens,
-              completion_tokens: responseData.usage.completion_tokens,
-              total_tokens: responseData.usage.total_tokens
-            })
-            .eq('api_key_hash', hashedKey)
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1);
-        }
+        const responseTimeMs = Date.now() - startTime;
+        await logApiUsage(apiKey, exportData.user_id, request.url, modelToUse, supabase, fastify.log, promptTokens, completionTokens, responseTimeMs);
 
-        return reply.send(responseData);
+      } catch (error: any) {
+        fastify.log.error({ msg: 'Exported Session API (v1) consumption error', err: error.message, apiKeyId: exportData?.id }); // Added optional chaining
+        if (!reply.sent) reply.code(500).send({ error: error.message });
+        else if (!reply.raw.writableEnded) reply.raw.end();
       }
-    } catch (error) {
-      console.error('Session API Error:', error);
-      return reply.status(500).send({ error: 'Internal server error' });
     }
-  });
+  );
 
-  // Models endpoint - returns available models for this API
-  fastify.get('/api/exported/v1/models', {
-    preHandler: validateExportedApiKey
-  }, async (request: FastifyRequest, reply: FastifyReply) => {
+  fastify.get('/api/exported/v1/models', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+    const exportData = request.exportedApiData!;
     try {
-      const exportedApi = (request as any).exportedApi;
-
-      // Get available models from OpenRouter
-      const openRouterResponse = await fetch('https://openrouter.ai/api/v1/models', {
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`
-        }
-      });
-
-      if (!openRouterResponse.ok) {
-        return reply.status(500).send({ error: 'Failed to fetch models' });
-      }
-
-      const modelsData = await openRouterResponse.json();
-      let availableModels = modelsData.data;
-
-      // Filter models based on API configuration
-      if (exportedApi.allowed_models && exportedApi.allowed_models.length > 0) {
-        availableModels = availableModels.filter((model: any) => 
-          exportedApi.allowed_models.includes(model.id)
-        );
-      }
-
-      // Add base model option if configured
-      if (exportedApi.base_model) {
-        availableModels.unshift({
-          id: 'base',
-          name: `Base Model (${exportedApi.base_model})`,
-          description: `Default model for this API: ${exportedApi.base_model}`
+        const response = await fetch('https://openrouter.ai/api/v1/models', {
+            headers: { 'Authorization': `Bearer ${openRouterApiKey}` },
         });
-      }
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Failed to fetch models from OpenRouter: ${errorText}`);
+        }
+        const allModelsData: any = await response.json();
+        let modelsToList = allModelsData.data;
 
-      return reply.send({
-        object: 'list',
-        data: availableModels
-      });
-    } catch (error) {
-      console.error('Models API Error:', error);
-      return reply.status(500).send({ error: 'Internal server error' });
+        if (exportData.allowed_models && exportData.allowed_models.length > 0) {
+            modelsToList = allModelsData.data.filter((m: any) => exportData.allowed_models.includes(m.id));
+        }
+        
+        const apiKey = request.headers.authorization!.split(' ')[1];
+        await logApiUsage(apiKey, exportData.user_id, request.url, 'N/A (models_list)', supabase, fastify.log, 0, 0, 0);
+
+        reply.send({ data: modelsToList });
+    } catch (error: any) {
+        fastify.log.error({ msg: 'Error fetching models for exported API', err: error.message, apiKeyId: exportData?.id }); // Added optional chaining
+        reply.code(500).send({ error: 'Could not fetch models.' });
     }
   });
+
 }
