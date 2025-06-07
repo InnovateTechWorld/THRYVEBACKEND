@@ -1104,48 +1104,86 @@ logger.info('💰 Credit processing info:', {
    * Process credit top-up
    */
   async function processCreditTopup(
-    transaction: any,
-    userId: string,
-    supabase: any,
-    logger: any
-  ) {
-    try {
-      // Add credits to user account
-      const { data: currentCredits } = await supabase
-        .from('user_credits')
-        .select('credits')
-        .eq('user_id', userId)
-        .single();
+  transaction: any,
+  userId: string,
+  supabase: any,
+  logger: any
+) {
+  try {
+    logger.info('🔄 Starting credit topup processing:', {
+      userId,
+      transactionId: transaction.id,
+      creditAmount: transaction.credit_amount,
+      type: transaction.type
+    });
 
-      const newCredits = (currentCredits?.credits || 0) + transaction.credit_amount;
+    // ✅ FIXED: Use correct table name 'user_credit_balances' (not 'user_credits')
+    const { data: currentCredits } = await supabase
+      .from('user_credit_balances') // ✅ FIXED: Correct table name
+      .select('available_credits, total_purchased, total_used')
+      .eq('user_id', userId)
+      .single();
 
-      const { error: creditsError } = await supabase
-        .from('user_credits')
-        .upsert({
-          user_id: userId,
-          credits: newCredits,
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'user_id'
-        });
+    console.log('=== TOPUP CREDITS DEBUG ===');
+    console.log('Current Credits:', currentCredits);
+    console.log('Credit Amount to Add:', transaction.credit_amount);
+    console.log('Credit Amount (openrouter):', transaction.openrouter_credit_amount);
+    console.log('================================');
 
-      if (creditsError) {
-        logger.error('Failed to add topup credits:', creditsError);
-        throw creditsError;
-      }
+    // Calculate new amounts
+    const creditAmount = parseFloat(transaction.credit_amount || transaction.openrouter_credit_amount || '0');
+    const newAvailableCredits = (currentCredits?.available_credits || 0) + creditAmount;
+    const newTotalPurchased = (currentCredits?.total_purchased || 0) + creditAmount;
 
-      logger.info({
-        msg: 'Credit topup processed successfully',
-        userId,
-        creditAmount: transaction.credit_amount,
-        newTotal: newCredits
+    // ✅ FIXED: Update user_credit_balances table with correct field names
+    const { data: updatedCredits, error: creditsError } = await supabase
+      .from('user_credit_balances') // ✅ FIXED: Correct table name
+      .upsert({
+        user_id: userId,
+        available_credits: newAvailableCredits, // ✅ FIXED: Correct field name
+        total_purchased: newTotalPurchased,     // ✅ FIXED: Correct field name
+        total_used: currentCredits?.total_used || 0, // Keep existing usage
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      })
+      .select('*');
+
+    if (creditsError) {
+      console.log('=== CREDITS UPDATE ERROR ===');
+      console.log('Error:', JSON.stringify(creditsError, null, 2));
+      console.log('Update Data:', {
+        user_id: userId,
+        available_credits: newAvailableCredits,
+        total_purchased: newTotalPurchased,
+        total_used: currentCredits?.total_used || 0
       });
-
-    } catch (error) {
-      logger.error('Failed to process credit topup:', error);
-      throw error;
+      console.log('================================');
+      
+      logger.error('❌ Failed to add topup credits:', creditsError);
+      throw creditsError;
     }
+
+    logger.info('✅ Topup credits added successfully:', {
+      userId,
+      creditsAdded: creditAmount,
+      newAvailableCredits: newAvailableCredits,
+      newTotalPurchased: newTotalPurchased,
+      updatedCredits: updatedCredits[0]
+    });
+
+    return true;
+
+  } catch (error: any) {
+    logger.error('❌ Failed to process credit topup:', {
+      error: error.message,
+      stack: error.stack,
+      userId,
+      transactionId: transaction.id
+    });
+    throw error;
   }
+}
 
   /**
    * Calculate subscription period end date
