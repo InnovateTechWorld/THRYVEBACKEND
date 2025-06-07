@@ -1,0 +1,728 @@
+import { SupabaseClient } from '@supabase/supabase-js';
+import { FastifyBaseLogger } from 'fastify';
+import crypto from 'crypto';
+import { CurrencyConverter } from './currencyConverter';
+
+export interface PaymentInitData {
+  userId: string;
+  email: string;
+  fullName?: string;
+  phoneNumber?: string;
+  amount: number;
+  currency: string;
+  type: 'subscription' | 'topup';
+  planId?: string;
+  redirectUrl: string;
+  country?: string;
+}
+
+export interface PaymentMethodsResponse {
+  country: string;
+  currency: string;
+  methods: PaymentMethod[];
+}
+
+export interface PaymentMethod {
+  type: string;
+  name: string;
+  icon?: string;
+  supported_currencies: string[];
+}
+
+export interface FlutterwavePaymentPlan {
+  id: number;
+  name: string;
+  amount: number;
+  interval: string;
+  currency: string;
+  plan_token: string;
+  status: string;
+  created_at: string;
+}
+
+// Flutterwave API Response Types
+interface FlutterwaveResponse<T = any> {
+  status: string;
+  message: string;
+  data: T;
+}
+
+interface FlutterwavePaymentResponse {
+  id?: string;
+  link: string;
+}
+
+interface FlutterwaveTransactionData {
+  id: string;
+  tx_ref: string;
+  flw_ref: string;
+  status: string;
+  payment_type: string;
+  amount: number;
+  currency: string;
+  processor_response: string;
+  customer: {
+    id: string;
+    email: string;
+    name: string;
+  };
+  card?: {
+    first_6digits: string;
+    last_4digits: string;
+    type: string;
+    country: string;
+  };
+}
+
+interface FlutterwavePlanData {
+  id: number;
+  name: string;
+  amount: number;
+  interval: string;
+  currency: string;
+  plan_token: string;
+  status: string;
+  created_at: string;
+}
+
+export class FlutterwaveService {
+  private secretKey: string;
+  private publicKey: string;
+  private webhookSecret: string;
+  private baseUrl: string;
+
+  constructor(publicKey: string, secretKey: string, webhookSecret: string) {
+    if (!secretKey || !publicKey) {
+      throw new Error('Flutterwave public and secret keys are required');
+    }
+    
+    this.publicKey = publicKey;
+    this.secretKey = secretKey;
+    this.webhookSecret = webhookSecret;
+    this.baseUrl = 'https://api.flutterwave.com/v3';
+  }
+
+  /**
+   * Initialize payment using Flutterwave Standard API
+   * ✅ FIXED: Using correct database field names
+   */
+  async initializePayment(
+    paymentData: PaymentInitData,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<{ paymentUrl: string; reference: string; transaction_id?: string }> {
+    try {
+      const reference = `${paymentData.type}_${paymentData.userId}_${Date.now()}`;
+      
+      // Convert to USD for OpenRouter credits
+      const amountInUSD = paymentData.currency === 'USD' 
+        ? paymentData.amount 
+        : CurrencyConverter.toUSD(paymentData.amount, paymentData.currency);
+
+      // ✅ FIXED: Calculate correct credit amount based on type
+      let creditAmount: number;
+      let platformFeeUSD: number;
+
+      if (paymentData.type === 'subscription' && paymentData.planId) {
+        // For subscriptions: Get the actual credits from the plan (already discounted)
+        const { data: planData, error: planError } = await supabase
+          .from('subscription_plans')
+          .select('credits')
+          .eq('id', paymentData.planId)
+          .single();
+
+        if (planError || !planData) {
+          logger.error({ msg: 'Plan not found for subscription', planId: paymentData.planId, error: planError });
+          throw new Error('Subscription plan not found');
+        }
+
+        creditAmount = parseFloat(planData.credits) || 0; // $8 for Pro, $20 for Power, $0 for Free
+        platformFeeUSD = amountInUSD - creditAmount; // Platform keeps the difference
+
+        logger.info({ 
+          msg: 'Subscription transaction - using plan credits',
+          planId: paymentData.planId,
+          paymentAmount: amountInUSD,
+          creditsToReceive: creditAmount,
+          platformFee: platformFeeUSD
+        });
+
+      } else {
+        // For top-ups: User gets full amount in credits (minus platform fee)
+        platformFeeUSD = amountInUSD * 0.15; // 15% platform fee for top-ups
+        creditAmount = amountInUSD; // User gets full amount for top-ups
+
+        logger.info({ 
+          msg: 'Top-up transaction - full amount as credits',
+          paymentAmount: amountInUSD,
+          creditsToReceive: creditAmount,
+          platformFee: platformFeeUSD
+        });
+      }
+      
+      // Get exchange rate for tracking
+      const exchangeRate = paymentData.currency === 'USD' 
+        ? 1.0 
+        : CurrencyConverter.getExchangeRate(paymentData.currency, 'USD');
+
+      // Get supported payment methods for this currency
+      const supportedMethods = CurrencyConverter.getSupportedPaymentMethods(paymentData.currency);
+      const paymentOptions = supportedMethods.join(',');
+
+      // Standard API payload - exactly as per Flutterwave documentation
+      const payload = {
+        tx_ref: reference,
+        amount: paymentData.amount.toString(), // Must be string as per docs
+        currency: paymentData.currency.toUpperCase(),
+        redirect_url: paymentData.redirectUrl,
+        customer: {
+          email: paymentData.email,
+          name: paymentData.fullName || paymentData.email.split('@')[0],
+          ...(paymentData.phoneNumber && { phonenumber: paymentData.phoneNumber })
+        },
+        // Basic customizations only to avoid blocking
+        customizations: {
+          title: paymentData.type === 'subscription' ? 'AI Platform Subscription' : 'AI Platform Credits',
+          description: paymentData.type === 'subscription' 
+            ? 'Subscribe to unlock premium AI features' 
+            : 'Top up your AI credits',
+          logo: '' // You can add your logo URL here
+        },
+        // ✅ FIXED: Store the plan_id in metadata for subscriptions
+        meta: {
+          user_id: paymentData.userId,
+          type: paymentData.type,
+          plan_id: paymentData.planId || '', // ✅ THIS IS IMPORTANT - plan_id for subscription processing
+          platform_fee_usd: platformFeeUSD,
+          credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive
+          exchange_rate: exchangeRate,
+          country: paymentData.country || 'NG'
+        },
+        // Dynamic payment options based on currency support
+        payment_options: paymentOptions,
+        // Session configurations
+        configurations: {
+          session_duration: 1440, // 24 hours max
+          max_retry_attempt: 3
+        }
+      };
+
+      logger.info({ 
+        msg: 'Initializing Flutterwave Standard payment', 
+        reference, 
+        currency: paymentData.currency,
+        amountLocal: paymentData.amount,
+        amountUSD: amountInUSD,
+        exchangeRate,
+        supportedMethods,
+        creditsToReceive: creditAmount,
+        platformFee: platformFeeUSD
+      });
+
+      // ✅ FIXED: Store transaction record with correct credit amounts
+      const { data: transaction, error: dbError } = await supabase
+        .from('payment_transactions')
+        .insert({
+          user_id: paymentData.userId,
+          flutterwave_reference: reference,
+          flutterwave_transaction_id: null,
+          type: paymentData.type,
+          // plan_id: paymentData.planId || null, // ✅ FIXED: Store plan_id for subscriptions
+          
+          // Required basic fields
+          amount: paymentData.amount,
+          currency: paymentData.currency,
+          credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive (not full payment)
+          
+          // Detailed tracking fields
+          amount_usd: amountInUSD,
+          amount_local: paymentData.amount,
+          local_currency: paymentData.currency,
+          exchange_rate: exchangeRate,
+          openrouter_credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive
+          platform_fee: platformFeeUSD,
+          status: 'pending',
+          country: paymentData.country || 'NG',
+          metadata: {
+            customer_info: {
+              email: paymentData.email,
+              name: paymentData.fullName || paymentData.email.split('@')[0],
+              phone: paymentData.phoneNumber
+            },
+            payload_sent: payload
+          }
+        })
+        .select()
+        .single();
+
+      // Continue with rest of the method...
+      if (dbError) {
+        logger.error('Failed to store payment transaction:', { 
+          error: dbError,
+          reference,
+          userId: paymentData.userId,
+          amount: paymentData.amount,
+          currency: paymentData.currency,
+          type: paymentData.type
+        });
+        throw new Error(`Failed to record payment transaction: ${dbError.message}`);
+      }
+
+      if (!transaction) {
+        logger.error('Transaction not returned from database insert:', { reference });
+        throw new Error('Failed to create transaction record');
+      }
+
+      logger.info('Transaction created successfully:', { 
+        transactionId: transaction.id,
+        reference,
+        amount: paymentData.amount,
+        creditsToReceive: creditAmount
+      });
+
+      // Continue with Flutterwave API call...
+      const response = await fetch(`${this.baseUrl}/payments`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+
+
+      const responseData = await response.json() as FlutterwaveResponse<FlutterwavePaymentResponse>;
+
+      if (!response.ok || responseData.status !== 'success') {
+        logger.error({ msg: 'Flutterwave payment initialization failed', response: responseData });
+        
+        // Update transaction status to failed
+        await supabase
+          .from('payment_transactions')
+          .update({ 
+            status: 'failed',
+            metadata: {
+              ...transaction.metadata,
+              failure_reason: responseData.message || 'Payment initialization failed',
+              error_response: responseData
+            },
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', transaction.id);
+        
+        throw new Error(`Payment initialization failed: ${responseData.message || 'Unknown error'}`);
+      }
+
+      const paymentUrl = responseData.data.link;
+
+      if (!paymentUrl) {
+        throw new Error('No payment link received from Flutterwave');
+      }
+
+      // ✅ FIXED: Update transaction with Flutterwave response using correct field names
+      await supabase
+        .from('payment_transactions')
+        .update({
+          flutterwave_transaction_id: responseData.data.id?.toString() || null, // ✅ FIXED
+          metadata: {
+            ...transaction.metadata,
+            flutterwave_response: responseData.data,
+            payment_link: paymentUrl
+          },
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', transaction.id);
+
+      logger.info({ msg: 'Payment initialized successfully', reference, paymentUrl });
+
+      return {
+        paymentUrl,
+        reference,
+        transaction_id: responseData.data.id
+      };
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error initializing payment', error: error.message,   stack: error.stack, paymentData });
+      throw error;
+    }
+  }
+
+  /**
+   * ✅ FIXED: Verify payment using transaction ID with correct field names
+   */
+  async verifyPayment(
+    transactionId: string,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<{ verified: boolean; data?: any }> {
+    try {
+      logger.info({ msg: 'Verifying payment', transactionId });
+
+      const response = await fetch(`${this.baseUrl}/transactions/${transactionId}/verify`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const responseData = await response.json() as FlutterwaveResponse<FlutterwaveTransactionData>;
+
+      if (!response.ok || responseData.status !== 'success') {
+        logger.warn({ msg: 'Payment verification failed', transactionId, response: responseData });
+        return { verified: false };
+      }
+
+      const paymentData = responseData.data;
+      
+      // ✅ FIXED: Update transaction status in database with correct field names
+      const { error: updateError } = await supabase
+        .from('payment_transactions')
+        .update({
+          status: paymentData.status === 'successful' ? 'completed' : 'failed',
+          payment_method: paymentData.payment_type,
+          flutterwave_transaction_id: paymentData.id.toString(), // ✅ FIXED
+          metadata: {
+            verification_data: paymentData,
+            processor_response: paymentData.processor_response
+          },
+          completed_at: paymentData.status === 'successful' ? new Date().toISOString() : null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('flutterwave_reference', paymentData.tx_ref); // ✅ FIXED
+
+      if (updateError) {
+        logger.error({ msg: 'Failed to update transaction status', error: updateError });
+      }
+
+      logger.info({ msg: 'Payment verified successfully', transactionId, status: paymentData.status });
+      
+      return { 
+        verified: paymentData.status === 'successful',
+        data: paymentData
+      };
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error verifying payment', error: error.message, transactionId });
+      return { verified: false };
+    }
+  }
+
+  /**
+   * Get supported payment methods with enhanced international currency support
+   */
+  getPaymentMethods(
+    country: string,
+    currency: string
+  ): PaymentMethodsResponse {
+    // Check if currency is supported
+    if (!CurrencyConverter.isSupported(currency)) {
+      return {
+        country,
+        currency,
+        methods: []
+      };
+    }
+
+    // Get supported payment methods for this currency
+    const supportedMethods = CurrencyConverter.getSupportedPaymentMethods(currency);
+    
+    const methods: PaymentMethod[] = supportedMethods.map(method => {
+      switch (method) {
+        case 'card':
+          return {
+            type: 'card',
+            name: 'Debit/Credit Card',
+            icon: '💳',
+            supported_currencies: Object.keys(CurrencyConverter.getSupportedCurrencies())
+          };
+        case 'applepay':
+          return {
+            type: 'applepay',
+            name: 'Apple Pay',
+            icon: '🍎',
+            supported_currencies: ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'NGN', 'GHS']
+          };
+        case 'googlepay':
+          return {
+            type: 'googlepay',
+            name: 'Google Pay',
+            icon: '🟢',
+            supported_currencies: ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'NGN', 'GHS']
+          };
+        default:
+          return {
+            type: method,
+            name: method.charAt(0).toUpperCase() + method.slice(1),
+            icon: '💰',
+            supported_currencies: [currency]
+          };
+      }
+    });
+
+    return {
+      country,
+      currency,
+      methods
+    };
+  }
+
+  /**
+   * Create a payment plan for subscriptions using Flutterwave Standard API
+   */
+  async createPaymentPlan(
+    planData: {
+      name: string;
+      amount: number;
+      currency: string;
+      interval: string;
+      duration?: number;
+    },
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<FlutterwavePaymentPlan> {
+    try {
+      logger.info({ msg: 'Creating Flutterwave payment plan', planData });
+
+      const payload = {
+        amount: planData.amount,
+        name: planData.name,
+        interval: planData.interval.toLowerCase(),
+        currency: planData.currency.toUpperCase(),
+        ...(planData.duration && { duration: planData.duration })
+      };
+
+      const response = await fetch(`${this.baseUrl}/payment-plans`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const responseData = await response.json() as FlutterwaveResponse<FlutterwavePlanData>;
+
+      if (!response.ok || responseData.status !== 'success') {
+        logger.error({ msg: 'Flutterwave payment plan creation failed', response: responseData });
+        throw new Error(`Payment plan creation failed: ${responseData.message || 'Unknown error'}`);
+      }
+
+      const plan = responseData.data;
+
+      logger.info({ msg: 'Payment plan created successfully', planId: plan.id });
+
+      return {
+        id: plan.id,
+        name: plan.name,
+        amount: plan.amount,
+        interval: plan.interval,
+        currency: plan.currency,
+        plan_token: plan.plan_token,
+        status: plan.status,
+        created_at: plan.created_at
+      };
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error creating payment plan', error: error.message, planData });
+      throw error;
+    }
+  }
+
+  /**
+   * Verify webhook signature (as per Flutterwave documentation)
+   */
+  verifyWebhookSignature(payload: string, signature: string): boolean {
+    if (!this.webhookSecret || !signature) {
+      return false;
+    }
+
+    try {
+      // Flutterwave sends the signature in the 'verif-hash' header
+      return signature === this.webhookSecret;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * ✅ FIXED: Process webhook event with correct field names
+   */
+  async processWebhook(
+    webhookData: any,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<boolean> {
+    try {
+      logger.info({ msg: 'Processing Flutterwave webhook', event: webhookData.event });
+
+      if (webhookData.event === 'charge.completed') {
+        const transactionData = webhookData.data as FlutterwaveTransactionData;
+        
+        // ✅ FIXED: Find the transaction by flutterwave_reference
+        const { data: existingTransaction, error: fetchError } = await supabase
+          .from('payment_transactions')
+          .select('*')
+          .eq('flutterwave_reference', transactionData.tx_ref) // ✅ FIXED
+          .single();
+
+        if (fetchError) {
+          logger.error({ msg: 'Transaction not found for webhook', txRef: transactionData.tx_ref });
+          return false;
+        }
+
+        // Update transaction status
+        const updateData: any = {
+          status: transactionData.status === 'successful' ? 'completed' : 'failed',
+          payment_method: transactionData.payment_type,
+          flutterwave_transaction_id: transactionData.id.toString(), // ✅ FIXED
+          metadata: {
+            ...existingTransaction.metadata,
+            verification_data: transactionData
+          },
+          updated_at: new Date().toISOString()
+        };
+
+        if (transactionData.status === 'successful') {
+          updateData.completed_at = new Date().toISOString();
+        }
+
+        const { error: updateError } = await supabase
+          .from('payment_transactions')
+          .update(updateData)
+          .eq('flutterwave_reference', transactionData.tx_ref); // ✅ FIXED
+
+        if (updateError) {
+          logger.error({ msg: 'Failed to update transaction from webhook', error: updateError });
+          return false;
+        }
+
+        // If payment successful, update user credits or subscription
+        if (transactionData.status === 'successful') {
+          if (existingTransaction.type === 'topup') { // ✅ FIXED
+            await this.updateUserKeyLimit(
+              existingTransaction.user_id,
+              existingTransaction.openrouter_credit_amount,
+              supabase,
+              logger
+            );
+          } else if (existingTransaction.type === 'subscription') { // ✅ FIXED
+            await this.updateUserSubscription(
+              existingTransaction.user_id,
+              existingTransaction.plan_id,
+              supabase,
+              logger
+            );
+          }
+        }
+
+        logger.info({ msg: 'Webhook processed successfully', txRef: transactionData.tx_ref });
+        return true;
+      }
+
+      // Handle subscription events
+      if (webhookData.event === 'subscription.cancelled') {
+        const subscriptionData = webhookData.data;
+        logger.info({ msg: 'Subscription cancelled webhook received', subscriptionData });
+        return true;
+      }
+
+      return true;
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error processing webhook', error: error.message, webhookData });
+      return false;
+    }
+  }
+
+  /**
+   * Update user OpenRouter key limit
+   */
+  async updateUserKeyLimit(
+    userId: string,
+    creditAmount: number,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<boolean> {
+    try {
+      logger.info({ msg: 'Updating user key limit', userId, creditAmount });
+      
+      // Get user's active OpenRouter key
+      const { data: userKey, error: keyError } = await supabase
+        .from('user_openrouter_keys')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .single();
+
+      if (keyError || !userKey) {
+        logger.error({ msg: 'No active OpenRouter key found for user', userId, error: keyError });
+        return false;
+      }
+
+      // Update credit limit
+      const newCreditLimit = (userKey.credit_limit || 0) + creditAmount;
+
+      // Update locally
+      const { error: updateError } = await supabase
+        .from('user_openrouter_keys')
+        .update({
+          credit_limit: newCreditLimit,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', userKey.id);
+
+      if (updateError) {
+        logger.error({ msg: 'Failed to update local key limit', error: updateError });
+        return false;
+      }
+
+      logger.info({ msg: 'User key limit updated successfully', userId, newCreditLimit });
+      return true;
+    } catch (error: any) {
+      logger.error({ msg: 'Error updating user key limit', error: error.message, userId });
+      return false;
+    }
+  }
+
+  /**
+   * Update user subscription
+   */
+  async updateUserSubscription(
+    userId: string,
+    planId: string,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<boolean> {
+    try {
+      logger.info({ msg: 'Updating user subscription', userId, planId });
+
+      // Update user subscription
+      const { error: subError } = await supabase
+        .from('user_subscriptions')
+        .upsert({
+          user_id: userId,
+          plan_id: planId,
+          status: 'active',
+          is_active: true,
+          current_period_start: new Date().toISOString(),
+          current_period_end: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'user_id'
+        });
+
+      if (subError) {
+        logger.error({ msg: 'Failed to update subscription', error: subError });
+        return false;
+      }
+
+      logger.info({ msg: 'User subscription updated successfully', userId, planId });
+      return true;
+    } catch (error: any) {
+      logger.error({ msg: 'Error updating user subscription', error: error.message, userId });
+      return false;
+    }
+  }
+}

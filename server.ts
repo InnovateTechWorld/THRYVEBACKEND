@@ -16,6 +16,7 @@ import dashboardRoutes from './src/routes/dashboard';
 import developerRoutes from './src/routes/developer';
 import adminApiManagementRoutes from './src/routes/admin';
 import analyticsRoutes from './src/routes/analytics';
+import paymentRoutes from './src/routes/payment';
 
 
 declare module '@fastify/jwt' {
@@ -45,9 +46,19 @@ const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET as string;
 const geminiApiKey = process.env.GEMINI_API_KEY as string;
 const appBaseUrl = process.env.BASE_URL || 'http://localhost:3000';
 
+// Payment service environment variables
+const flwPublicKey = process.env.FLW_PUBLIC_KEY as string;
+const flwSecretKey = process.env.FLW_SECRET_KEY as string;
+const flwWebhookSecret = process.env.FLW_WEBHOOK_SECRET as string;
+const openRouterProvisioningKey = process.env.OPENROUTER_PROVISIONING_KEY as string;
+
 if (!supabaseUrl || !supabaseServiceKey || !openRouterApiKey || !supabaseJwtSecret || !geminiApiKey) {
   app.log.error('Missing critical environment variables.');
   process.exit(1);
+}
+
+if (!flwPublicKey || !flwSecretKey || !openRouterProvisioningKey) {
+  app.log.warn('Payment service environment variables missing. Payment features will be disabled.');
 }
 
 const supabase: SupabaseClient = createClient(supabaseUrl, supabaseServiceKey);
@@ -64,7 +75,7 @@ app.register(fastifyCors, {
   origin: true, 
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'apikey', 'x-api-key'], 
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'apikey', 'x-api-key', 'x-flutterwave-signature'], 
   exposedHeaders: ['Content-Type', 'Authorization', 'X-Session-ID'], 
   preflightContinue: false,
   optionsSuccessStatus: 204
@@ -72,7 +83,8 @@ app.register(fastifyCors, {
 
 app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
   const noAuthRoutes = [
-    '/oauth/token', 
+    '/oauth/token',
+    '/api/payment/webhook', // Flutterwave webhook doesn't need auth
   ];
 
   // Allow all exported API endpoints without auth
@@ -138,6 +150,14 @@ app.register(dashboardRoutes, { prefix: '/', supabase });
 app.register(developerRoutes, { prefix: '/', supabase }); 
 app.register(adminApiManagementRoutes, { prefix: '/api/admin', supabase });
 app.register(analyticsRoutes, { prefix: '/', supabase }); // Register analytics routes
+
+// Register payment routes if payment services are configured
+if (flwPublicKey && flwSecretKey && openRouterProvisioningKey) {
+  app.register(paymentRoutes, { prefix: '/', supabase });
+  app.log.info('Payment services enabled');
+} else {
+  app.log.warn('Payment services disabled due to missing configuration');
+}
 
 app.register(exportedApiRoutes, { supabase, genAI, openRouterApiKey });
 
