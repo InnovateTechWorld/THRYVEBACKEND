@@ -5,6 +5,7 @@ import { verifyExportedApiKey, logApiUsage } from '../lib/apiUtils';
 import { getUserContext, buildExportedContextAwareMessages, buildExportedSessionAwareMessages, processMessageContent, extractOpenAIParameters } from '../lib/context';
 import { callOpenRouter, filterRelevantContext, getModelCapabilities } from '../lib/ai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { OpenRouterManager, OpenRouterError } from '../lib/openRouterManager';
 
 interface ExportContextBody {
   modelsToExpose: string[];
@@ -24,6 +25,19 @@ interface ExportSessionParams {
 
 interface ExportUsageParams {
   apiKey: string;
+}
+
+// Define a type for the request user after API key verification
+interface AuthenticatedRequest extends FastifyRequest {
+  exportedApiData?: any;
+}
+
+// Error codes for OpenRouter integration
+enum LegacyApiError {
+  MODEL_NOT_ALLOWED_FOR_PLAN = 'MODEL_NOT_ALLOWED_FOR_PLAN',
+  CREDIT_INSUFFICIENT = 'CREDIT_INSUFFICIENT',
+  USER_KEY_DISABLED = 'USER_KEY_DISABLED',
+  USER_KEY_NOT_FOUND = 'USER_KEY_NOT_FOUND'
 }
 
 // Enhanced chat completions body for legacy endpoints
@@ -57,16 +71,17 @@ interface LegacyChatCompletionsParams {
   apiKey: string;
 }
 
+// Update the options interface to include openRouterProvisioningKey
 export default async function apiManagementRoutes(
   fastify: FastifyInstance,
   options: {
     supabase: SupabaseClient,
     genAI: GoogleGenerativeAI,
-    openRouterApiKey: string,
-    appBaseUrl: string
+    appBaseUrl: string,
+    openRouterProvisioningKey: string
   }
 ) {
-  const { supabase, genAI, openRouterApiKey, appBaseUrl } = options;
+  const { supabase, genAI, appBaseUrl, openRouterProvisioningKey } = options;
 
   // Create Context Export API
   fastify.post(
@@ -250,7 +265,7 @@ export default async function apiManagementRoutes(
         fastify.log.info({
           msg: '🔵 LEGACY CONTEXT API - Step 1: Getting User Context',
           userId: exportData.user_id
-        });
+          });
         const userContext = await getUserContext(exportData.user_id, supabase, fastify.log);
         fastify.log.info({
           msg: '🔵 LEGACY CONTEXT API - Step 1 Complete: User Context Retrieved',
@@ -336,18 +351,113 @@ export default async function apiManagementRoutes(
           openRouterParams.max_tokens = modelCapabilities.maxTokens;
         }
 
-        // STEP 4: Call OpenRouter
+        // STEP 4: Check user credits and get user's OpenRouter key
+        const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
+        
+        // Check user credits before making the call (estimate 1 credit for API call)
+const creditCheckResponse = await openRouterManager.checkUserCredits(
+  exportData.user_id, 
+  0.001, 
+  supabase, 
+  fastify.log,
+  modelToUse // ✅ Pass the model being used
+);
+
+
+if (!creditCheckResponse.success) {
+  if (creditCheckResponse.error?.code === OpenRouterError.KEY_NOT_FOUND) {
+    fastify.log.error({ msg: 'User OpenRouter key not found', userId: exportData.user_id });
+    return reply.code(404).send({
+      error: {
+        message: 'OpenRouter key not found. Please contact support.',
+        type: 'authentication_error',
+        code: LegacyApiError.USER_KEY_NOT_FOUND
+      }
+    });
+  } else if (creditCheckResponse.error?.code === OpenRouterError.INSUFFICIENT_CREDITS) {
+    fastify.log.warn({ msg: 'User has insufficient credits', userId: exportData.user_id, model: modelToUse });
+    return reply.code(402).send({
+      error: {
+        message: `${creditCheckResponse.error.message}`,
+        type: 'insufficient_quota',
+        code: LegacyApiError.CREDIT_INSUFFICIENT,
+        details: {
+          available: creditCheckResponse.error.details?.available || 0,
+          freeModelsAvailable: creditCheckResponse.error.details?.freeModelsAvailable || [],
+          suggestion: creditCheckResponse.error.details?.suggestion || 'Consider using a free model',
+          freeModelPattern: 'Models ending with ":free" don\'t require credits'
+        }
+      }
+    });
+  } else {
+    fastify.log.error({ msg: 'Failed to check user credits', userId: exportData.user_id, error: creditCheckResponse.error });
+    return reply.code(500).send({
+      error: {
+        message: creditCheckResponse.error?.message || 'Credit check failed',
+        type: 'api_error',
+        code: 'credit_check_failed'
+      }
+    });
+  }
+}
+
+const { sufficient, available, isFreeModel } = creditCheckResponse.data!;
+
+// Only check credits for paid models
+if (!isFreeModel && (!sufficient || available <= 0)) {
+  fastify.log.warn({ msg: 'User has insufficient credits for paid model', userId: exportData.user_id, available, sufficient, model: modelToUse });
+  return reply.code(402).send({
+    error: {
+      message: 'Your credit balance is insufficient for this paid model. Please top up or use a free model.',
+      type: 'insufficient_quota',
+      code: LegacyApiError.CREDIT_INSUFFICIENT,
+      details: {
+        available,
+        modelType: 'paid',
+        suggestion: 'Try a model ending with ":free" which doesn\'t require credits'
+      }
+    }
+  });
+}
+
+fastify.log.info({ 
+  msg: 'Model access granted for API call', 
+  userId: exportData.user_id, 
+  model: modelToUse, 
+  modelType: isFreeModel ? 'free' : 'paid',
+  creditsAvailable: available 
+});
+
+
+        // Get user's API key
+        const apiKeyResponse = await openRouterManager.getUserApiKey(exportData.user_id, supabase, fastify.log);
+
+        if (!apiKeyResponse.success) {
+          fastify.log.error({ msg: 'Failed to get OpenRouter key for user', userId: exportData.user_id, error: apiKeyResponse.error });
+          return reply.code(500).send({
+            error: {
+              message: 'Failed to retrieve your OpenRouter key. Please contact support.',
+              type: 'api_error',
+              code: LegacyApiError.USER_KEY_NOT_FOUND
+            }
+          });
+        }
+
+        const userApiKey = apiKeyResponse.data;
+
+        // STEP 5: Call OpenRouter with user's key
         fastify.log.info({
-          msg: '🔵 LEGACY CONTEXT API - Step 4: Sending to OpenRouter',
+          msg: '🔵 LEGACY CONTEXT API - Step 5: Sending to OpenRouter with user key',
           model: modelToUse,
           messagesCount: contextAwareMessages.length,
-          parameters: openRouterParams
+          parameters: openRouterParams,
+          keyType: 'user-openrouter-key'
         });
 
         const openRouterResponse = await callOpenRouter(
-          modelToUse, 
-          contextAwareMessages, 
-          openRouterApiKey, 
+          modelToUse,
+          contextAwareMessages,
+          userApiKey!,
           params.stream || false,
           openRouterParams
         );
@@ -388,7 +498,7 @@ export default async function apiManagementRoutes(
                   }
                   try {
                     const parsed = JSON.parse(data);
-                    if (parsed.usage) { 
+                    if (parsed.usage) {
                       promptTokens = parsed.usage.prompt_tokens || promptTokens;
                       completionTokens = parsed.usage.completion_tokens || completionTokens;
                     }
@@ -551,6 +661,7 @@ export default async function apiManagementRoutes(
           contentForFiltering = processMessageContent(lastMessage.content);
         }
 
+        // ALWAYS apply filtering if memories/notes exist and are enabled
         if (contentForFiltering.trim() && (exportData.include_memories || exportData.include_notes) && 
             (userContext.memories.length > 0 || userContext.notes.length > 0)) {
           
@@ -602,7 +713,7 @@ export default async function apiManagementRoutes(
           sessionHistory, // ALWAYS include full session history
           body.messages, // Third-party app's new messages
           exportData,
-          body.system_prompt // Allow system prompt override
+          body.system_prompt // Allow third-party system prompt override
         );
 
         fastify.log.info({
@@ -613,28 +724,123 @@ export default async function apiManagementRoutes(
           sessionHistoryIncluded: sessionHistory.length
         });
 
-        // Prepare OpenRouter parameters
+        // Prepare parameters for OpenRouter
         const openRouterParams = { ...params };
         delete openRouterParams.model;
         delete (openRouterParams as any).system_prompt;
 
-        // Validate max_tokens
+        // Validate max_tokens against model capabilities
         if (openRouterParams.max_tokens && openRouterParams.max_tokens > modelCapabilities.maxTokens) {
           openRouterParams.max_tokens = modelCapabilities.maxTokens;
         }
 
-        // STEP 5: Call OpenRouter
+        // STEP 5: Check user credits and get user's OpenRouter key
+        const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
+        
+        // Check user credits before making the call (estimate 1 credit for API call)
+const creditCheckResponse = await openRouterManager.checkUserCredits(
+  exportData.user_id, 
+  0.001, 
+  supabase, 
+  fastify.log,
+  modelToUse // ✅ Pass the model being used
+);
+
+
+if (!creditCheckResponse.success) {
+  if (creditCheckResponse.error?.code === OpenRouterError.KEY_NOT_FOUND) {
+    fastify.log.error({ msg: 'User OpenRouter key not found', userId: exportData.user_id });
+    return reply.code(404).send({
+      error: {
+        message: 'OpenRouter key not found. Please contact support.',
+        type: 'authentication_error',
+        code: LegacyApiError.USER_KEY_NOT_FOUND
+      }
+    });
+  } else if (creditCheckResponse.error?.code === OpenRouterError.INSUFFICIENT_CREDITS) {
+    fastify.log.warn({ msg: 'User has insufficient credits', userId: exportData.user_id, model: modelToUse });
+    return reply.code(402).send({
+      error: {
+        message: `${creditCheckResponse.error.message}`,
+        type: 'insufficient_quota',
+        code: LegacyApiError.CREDIT_INSUFFICIENT,
+        details: {
+          available: creditCheckResponse.error.details?.available || 0,
+          freeModelsAvailable: creditCheckResponse.error.details?.freeModelsAvailable || [],
+          suggestion: creditCheckResponse.error.details?.suggestion || 'Consider using a free model',
+          freeModelPattern: 'Models ending with ":free" don\'t require credits'
+        }
+      }
+    });
+  } else {
+    fastify.log.error({ msg: 'Failed to check user credits', userId: exportData.user_id, error: creditCheckResponse.error });
+    return reply.code(500).send({
+      error: {
+        message: creditCheckResponse.error?.message || 'Credit check failed',
+        type: 'api_error',
+        code: 'credit_check_failed'
+      }
+    });
+  }
+}
+
+const { sufficient, available, isFreeModel } = creditCheckResponse.data!;
+
+// Only check credits for paid models
+if (!isFreeModel && (!sufficient || available <= 0)) {
+  fastify.log.warn({ msg: 'User has insufficient credits for paid model', userId: exportData.user_id, available, sufficient, model: modelToUse });
+  return reply.code(402).send({
+    error: {
+      message: 'Your credit balance is insufficient for this paid model. Please top up or use a free model.',
+      type: 'insufficient_quota',
+      code: LegacyApiError.CREDIT_INSUFFICIENT,
+      details: {
+        available,
+        modelType: 'paid',
+        suggestion: 'Try a model ending with ":free" which doesn\'t require credits'
+      }
+    }
+  });
+}
+
+fastify.log.info({ 
+  msg: 'Model access granted for API call', 
+  userId: exportData.user_id, 
+  model: modelToUse, 
+  modelType: isFreeModel ? 'free' : 'paid',
+  creditsAvailable: available 
+});
+
+
+        // Get user's API key
+        const apiKeyResponse = await openRouterManager.getUserApiKey(exportData.user_id, supabase, fastify.log);
+
+        if (!apiKeyResponse.success) {
+          fastify.log.error({ msg: 'Failed to get OpenRouter key for user', userId: exportData.user_id, error: apiKeyResponse.error });
+          return reply.code(500).send({
+            error: {
+              message: 'Failed to retrieve your OpenRouter key. Please contact support.',
+              type: 'api_error',
+              code: LegacyApiError.USER_KEY_NOT_FOUND
+            }
+          });
+        }
+
+        const userApiKey = apiKeyResponse.data;
+
+        // STEP 6: Call OpenRouter with user's key
         fastify.log.info({
-          msg: '🟡 LEGACY SESSION API - Step 5: Sending to OpenRouter',
+          msg: '🟡 LEGACY SESSION API - Step 6: Sending to OpenRouter with user key',
           model: modelToUse,
           messagesCount: sessionAwareMessages.length,
-          parameters: openRouterParams
+          parameters: openRouterParams,
+          keyType: 'user-openrouter-key'
         });
 
         const openRouterResponse = await callOpenRouter(
-          modelToUse, 
-          sessionAwareMessages, 
-          openRouterApiKey, 
+          modelToUse,
+          sessionAwareMessages,
+          userApiKey!,
           params.stream || false,
           openRouterParams
         );
@@ -644,8 +850,8 @@ export default async function apiManagementRoutes(
             'Content-Type': 'text/event-stream', 
             'Cache-Control': 'no-cache', 
             'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Allow-Origin': '*', 
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization', 
           });
           
           const reader = openRouterResponse.body?.getReader();
@@ -657,7 +863,7 @@ export default async function apiManagementRoutes(
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              
+
               buffer += decoder.decode(value, { stream: true });
               
               while(true) {
@@ -731,4 +937,96 @@ export default async function apiManagementRoutes(
       }
     }
   );
+
+  // Enhanced models endpoint with detailed model information
+  // fastify.get('/api/exported/v1/models', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  //   const exportData = request.exportedApiData!;
+    
+  //   try {
+  //       // Get user's OpenRouter key
+  //       const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
+  //       const apiKeyResponse = await openRouterManager.getUserApiKey(exportData.user_id, supabase, fastify.log);
+
+  //       if (!apiKeyResponse.success) {
+  //         fastify.log.error({ msg: 'Failed to get OpenRouter key for user', userId: exportData.user_id, error: apiKeyResponse.error });
+  //         return reply.code(500).send({
+  //           error: {
+  //             message: 'Failed to retrieve your OpenRouter key. Please contact support.',
+  //             type: 'api_error',
+  //             code: 'user_key_not_found'
+  //           }
+  //         });
+  //       }
+
+  //       const userApiKey = apiKeyResponse.data;
+
+  //       const response = await fetch('https://openrouter.ai/api/v1/models', {
+  //           headers: { 'Authorization': `Bearer ${userApiKey}` },
+  //       });
+        
+  //       if (!response.ok) {
+  //           const errorText = await response.text();
+  //           throw new Error(`Failed to fetch models from OpenRouter: ${errorText}`);
+  //       }
+        
+  //       const allModelsData: any = await response.json();
+  //       let modelsToList = allModelsData.data;
+
+  //       // Filter by allowed models if specified
+  //       if (exportData.allowed_models && exportData.allowed_models.length > 0) {
+  //           modelsToList = allModelsData.data.filter((m: any) => 
+  //             exportData.allowed_models.includes(m.id)
+  //           );
+  //       }
+
+  //       // Enhance model data with capabilities
+  //       const enhancedModels = modelsToList.map((model: any) => {
+  //         const capabilities = getModelCapabilities(model.id);
+  //         return {
+  //           ...model,
+  //           capabilities: {
+  //             supports_reasoning: capabilities.supportsReasoning,
+  //             supports_tools: capabilities.supportsTools,
+  //             supports_images: capabilities.supportsImages,
+  //             is_reasoning_model: capabilities.isReasoningModel,
+  //             max_tokens: capabilities.maxTokens,
+  //             context_window: capabilities.contextWindow,
+  //           }
+  //         };
+  //       });
+        
+  //       // Log this access
+  //       const apiKey = request.headers.authorization!.split(' ')[1];
+  //       await logApiUsage(
+  //         apiKey, 
+  //         exportData.user_id, 
+  //         request.url, 
+  //         'N/A (models_list)', 
+  //         supabase, 
+  //         fastify.log, 
+  //         0, 
+  //         0, 
+  //         0
+  //       );
+
+  //       reply.send({ 
+  //         object: 'list',
+  //         data: enhancedModels 
+  //       });
+        
+  //   } catch (error: any) {
+  //       fastify.log.error({ 
+  //         msg: 'Error fetching models for exported API', 
+  //         err: error.message, 
+  //         apiKeyId: exportData?.id 
+  //       });
+  //       reply.code(500).send({ 
+  //         error: {
+  //           message: 'Could not fetch models.',
+  //           type: 'api_error',
+  //           code: 'models_fetch_error'
+  //         }
+  //       });
+  //   }
+  // });
 }

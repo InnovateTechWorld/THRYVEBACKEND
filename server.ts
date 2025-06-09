@@ -5,13 +5,16 @@ import fastifyJwt from '@fastify/jwt';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyCors from '@fastify/cors';
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { modelAccessMiddleware } from './src/middleware/modelAccessMiddleware';
+import { OpenRouterManager } from './src/lib/openRouterManager';
+import { registerCreditCheckMiddleware } from './src/middleware/creditCheckMiddleware';
 
 // Import modularized routes
-import { exportedApiRoutes } from './src/routes/exported-api'; 
+import { exportedApiRoutes } from './src/routes/exported-api';
 import userContextRoutes from './src/routes/userContext';
 import chatRoutes from './src/routes/chat';
 import modelRoutes from './src/routes/models';
-import apiManagementRoutes from './src/routes/apiManagement'; 
+import apiManagementRoutes from './src/routes/apiManagement';
 import dashboardRoutes from './src/routes/dashboard';
 import developerRoutes from './src/routes/developer';
 import adminApiManagementRoutes from './src/routes/admin';
@@ -30,7 +33,7 @@ declare module '@fastify/jwt' {
 
 declare module 'fastify' {
   interface FastifyRequest {
-    user: { 
+    user: {
       id: string;
       email?: string;
     };
@@ -40,7 +43,7 @@ declare module 'fastify' {
 const app: FastifyInstance = fastify({ logger: true });
 
 const supabaseUrl = process.env.SUPABASE_URL as string;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string; 
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
 const openRouterApiKey = process.env.OPENROUTER_API_KEY as string;
 const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET as string;
 const geminiApiKey = process.env.GEMINI_API_KEY as string;
@@ -52,31 +55,32 @@ const flwSecretKey = process.env.FLW_SECRET_KEY as string;
 const flwWebhookSecret = process.env.FLW_WEBHOOK_SECRET as string;
 const openRouterProvisioningKey = process.env.OPENROUTER_PROVISIONING_KEY as string;
 
-if (!supabaseUrl || !supabaseServiceKey || !openRouterApiKey || !supabaseJwtSecret || !geminiApiKey) {
+if (!supabaseUrl || !supabaseServiceKey || !supabaseJwtSecret || !geminiApiKey || !openRouterProvisioningKey) {
   app.log.error('Missing critical environment variables.');
   process.exit(1);
 }
 
-if (!flwPublicKey || !flwSecretKey || !openRouterProvisioningKey) {
-  app.log.warn('Payment service environment variables missing. Payment features will be disabled.');
+if (!flwPublicKey || !flwSecretKey || !flwWebhookSecret) {
+  app.log.warn('Flutterwave environment variables missing. Payment features will be disabled.');
 }
+
 
 const supabase: SupabaseClient = createClient(supabaseUrl, supabaseServiceKey);
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 
 app.register(fastifyJwt, {
   secret: supabaseJwtSecret,
-  decode: { complete: true } 
+  decode: { complete: true }
 });
 
 app.register(fastifyMultipart);
 
 app.register(fastifyCors, {
-  origin: true, 
+  origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'apikey', 'x-api-key', 'x-flutterwave-signature'], 
-  exposedHeaders: ['Content-Type', 'Authorization', 'X-Session-ID'], 
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'apikey', 'x-api-key', 'x-flutterwave-signature'],
+  exposedHeaders: ['Content-Type', 'Authorization', 'X-Session-ID'],
   preflightContinue: false,
   optionsSuccessStatus: 204
 });
@@ -93,15 +97,15 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
     request.url.startsWith('/api/exported/context/v1/') ||
     request.url.startsWith('/api/exported/session/v1/') ||
     request.url === '/api/exported/v1/models' ||
-    
+
     // Legacy path-based endpoints
     request.url.startsWith('/api/exported/context/') ||
     request.url.startsWith('/api/exported/session/') ||
-    
+
     // Models endpoints (both styles)
     request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/models$/) ||
     request.url.match(/\/api\/exported\/v1\/models$/) ||
-    
+
     // Chat completions endpoints
     request.url.match(/\/api\/exported\/(context|session)\/sk-[a-f0-9]+\/chat\/completions$/) ||
     request.url.match(/\/api\/exported\/(context|session)\/v1\/chat\/completions$/)
@@ -112,14 +116,14 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
   // Legacy parameter-based routes
   if ((request.url.startsWith('/api/exported/context/') || request.url.startsWith('/api/exported/session/')) &&
       request.params && (request.params as any).apiKey) {
-      return; 
+      return;
   }
 
   if (noAuthRoutes.includes(request.url)) {
     return;
   }
 
-  
+
   try {
     const authHeader = request.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -134,32 +138,51 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
       throw new Error('Invalid or expired token');
     }
 
-    request.user = { id: user.id, email: user.email }; 
+    request.user = { id: user.id, email: user.email };
   } catch (error: any) {
     reply.code(401).send({ error: 'Unauthorized', message: error.message });
-    return reply; 
+    return reply;
   }
 });
 
+// Initialize OpenRouter manager
+const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
+
+// Register credit check middleware first
+registerCreditCheckMiddleware(app, {
+  supabase,
+  openRouterProvisioningKey
+});
+
+// Register model access control middleware
+app.register(async (fastify) => {
+  fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!request.url.match(/\/chat\/completions$/)) {
+      return;
+    }
+    const handler = await modelAccessMiddleware(openRouterManager, supabase, fastify.log);
+    return handler(request as any, reply);
+  });
+});
 
 app.register(userContextRoutes, { prefix: '/', supabase });
-app.register(chatRoutes, { prefix: '/', supabase, genAI, openRouterApiKey });
-app.register(modelRoutes, { prefix: '/', openRouterApiKey });
-app.register(apiManagementRoutes, { prefix: '/', supabase, genAI, openRouterApiKey, appBaseUrl });
+app.register(chatRoutes, { prefix: '/', supabase, genAI, openRouterProvisioningKey });
+app.register(modelRoutes, { prefix: '/', openRouterProvisioningKey, supabase });
+app.register(apiManagementRoutes, { prefix: '/', supabase, genAI, appBaseUrl, openRouterProvisioningKey });
 app.register(dashboardRoutes, { prefix: '/', supabase });
-app.register(developerRoutes, { prefix: '/', supabase }); 
-app.register(adminApiManagementRoutes, { prefix: '/api/admin', supabase });
+app.register(developerRoutes, { prefix: '/', supabase });
+app.register(adminApiManagementRoutes, { prefix: '/api/admin', supabase, openRouterProvisioningKey });
 app.register(analyticsRoutes, { prefix: '/', supabase }); // Register analytics routes
 
 // Register payment routes if payment services are configured
-if (flwPublicKey && flwSecretKey && openRouterProvisioningKey) {
-  app.register(paymentRoutes, { prefix: '/', supabase });
+if (flwPublicKey && flwSecretKey && flwWebhookSecret) { // Check all Flutterwave keys
+  app.register(paymentRoutes, { prefix: '/', supabase, openRouterProvisioningKey });
   app.log.info('Payment services enabled');
 } else {
   app.log.warn('Payment services disabled due to missing configuration');
 }
 
-app.register(exportedApiRoutes, { supabase, genAI, openRouterApiKey });
+app.register(exportedApiRoutes, { supabase, genAI, openRouterProvisioningKey });
 
 
 const start = async () => {

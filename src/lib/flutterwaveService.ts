@@ -227,7 +227,7 @@ export class FlutterwaveService {
           flutterwave_reference: reference,
           flutterwave_transaction_id: null,
           type: paymentData.type,
-          // plan_id: paymentData.planId || null, // ✅ FIXED: Store plan_id for subscriptions
+          plan_id: paymentData.planId || null, // ✅ FIXED: Store plan_id for subscriptions
           
           // Required basic fields
           amount: paymentData.amount,

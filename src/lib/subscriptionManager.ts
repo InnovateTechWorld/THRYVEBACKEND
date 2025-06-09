@@ -294,12 +294,14 @@ export class SubscriptionManager {
 
       if (!credits) return false;
 
-      return this.openRouterManager.updateUserKeyLimit(
+      const response = await this.openRouterManager.updateUserKeyLimit(
         userId,
         credits.available_credits,
         this.supabase,
         this.logger
       );
+      
+      return response.success;
 
     } catch (error: any) {
       this.logger.error({ msg: 'Error updating API key limits', error: error.message, userId });

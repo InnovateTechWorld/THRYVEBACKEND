@@ -2,26 +2,70 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { FastifyBaseLogger } from 'fastify';
 import { EncryptionUtils } from '../utils/encryption';
 
-export interface OpenRouterKeyData {
-  id: string;
-  hash: string;
-  label: string;
-  name: string;
-  disabled: boolean;
-  limit: number;
-  usage: number;
-  created_at: string;
-  updated_at: string;
+export enum OpenRouterError {
+  INSUFFICIENT_CREDITS = 'INSUFFICIENT_CREDITS',
+  MODEL_NOT_ALLOWED = 'MODEL_NOT_ALLOWED',
+  PLAN_RESTRICTION = 'PLAN_RESTRICTION',
+  KEY_DISABLED = 'KEY_DISABLED',
+  SYNC_FAILED = 'SYNC_FAILED',
+  INTERNAL_ERROR = 'INTERNAL_ERROR',
+  KEY_NOT_FOUND = 'KEY_NOT_FOUND',
+  KEY_CREATION_FAILED = 'OPENROUTER_KEY_CREATION_FAILED',
+  LIMIT_UPDATE_FAILED = 'OPENROUTER_LIMIT_UPDATE_FAILED',
+  USAGE_SYNC_FAILED = 'OPENROUTER_USAGE_SYNC_FAILED',
+  CREDIT_ALLOCATION_FAILED = 'OPENROUTER_CREDIT_ALLOCATION_FAILED'
 }
 
-export interface CreateKeyResponse {
-  key: string;
-  data: OpenRouterKeyData;
+export interface OpenRouterResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: {
+    code: OpenRouterError;
+    message: string;
+    details?: any;
+  };
 }
+
+export interface OpenRouterKeyApiResponse {
+  data: {
+    name: string;
+    label: string;
+    limit: number;
+    disabled: boolean;
+    created_at: string;
+    updated_at: string;
+    hash: string; // ✅ This is the OpenRouter key hash
+  };
+  key: string; // ✅ The actual API key is at root level
+}
+
+export interface KeyUsageInfo {
+  usage: number;
+  limit: number | null;
+  remaining: number | null;
+  disabled: boolean;
+  lastSynced?: string;
+}
+
+// Define the expected structure from the check_user_credits RPC
+interface CheckUserCreditsResult {
+  has_credits: boolean;
+  available_credits: number;
+  error_message: string | null;
+}
+
+// Define the expected structure from the subscription_plans join
+interface SubscriptionPlanDetails {
+  id: string;
+  name: string;
+  free_models_only: boolean;
+  allowed_models: string[] | null;
+}
+
 
 export class OpenRouterManager {
   private provisioningKey: string;
-  private baseUrl: string = 'https://openrouter.ai/api/v1/keys';
+  private baseUrl: string = 'https://openrouter.ai/api/v1';
 
   constructor(provisioningKey: string) {
     if (!provisioningKey) {
@@ -29,172 +73,950 @@ export class OpenRouterManager {
     }
     this.provisioningKey = provisioningKey;
   }
+  checkModelRequiresCredits(modelId: string): boolean {
+  // Free models always end with ':free'
+  const isFreeModel = modelId.endsWith(':free');
+  
+  // Free models don't require credits
+  return !isFreeModel;
+}
+
+async getAvailableFreeModels(
+  userApiKey?: string,
+  logger?: FastifyBaseLogger
+): Promise<string[]> {
+  try {
+    const keyToUse = userApiKey || this.provisioningKey;
+    
+    const response = await fetch(`${this.baseUrl}/models`, {
+      headers: { 'Authorization': `Bearer ${keyToUse}` }
+    });
+
+    if (!response.ok) {
+      logger?.warn({ msg: 'Failed to fetch models for free model list', status: response.status });
+      // Return fallback list if API fails
+      return [
+        'meta-llama/llama-3.2-3b-instruct:free',
+        'meta-llama/llama-3.2-1b-instruct:free',
+        'google/gemma-2-9b-it:free',
+        'microsoft/phi-3-mini-128k-instruct:free',
+        'qwen/qwen-2-7b-instruct:free'
+      ];
+    }
+
+const data = await response.json() as { data: { id: string }[] };
+    const freeModels = data.data
+      .filter((model: any) => model.id.endsWith(':free'))
+      .map((model: any) => model.id)
+      .sort();
+
+    return freeModels;
+
+  } catch (error: any) {
+    logger?.warn({ msg: 'Error fetching free models', error: error.message });
+    // Return fallback list
+    return [
+      'meta-llama/llama-3.2-3b-instruct:free',
+      'meta-llama/llama-3.2-1b-instruct:free',
+      'google/gemma-2-9b-it:free',
+      'microsoft/phi-3-mini-128k-instruct:free',
+      'qwen/qwen-2-7b-instruct:free'
+    ];
+  }
+}
+
+
+
+  /**
+   * Create a new OpenRouter API key for a user with zero credits (for new users/free plans)
+   */
+  async createUserApiKeyWithZeroCredits(
+  userId: string,
+  email: string,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger
+): Promise<OpenRouterResponse<{ key: string; }>> {
+  try {
+    logger.info({ msg: 'Creating OpenRouter API key with zero credits', userId, email });
+
+    const response = await fetch(`${this.baseUrl}/keys`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.provisioningKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: `AI Platform - ${email} (Free)`,
+        label: `user-${userId.substring(0, 8)}-free`,
+        limit: 0
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error({ msg: 'Failed to create zero-credit key', status: response.status, error: errorText });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.KEY_CREATION_FAILED,
+          message: `Failed to create key: ${response.status}`,
+          details: errorText
+        }
+      };
+    }
+
+    const result = await response.json() as OpenRouterKeyApiResponse;
+    
+    // ✅ VALIDATION: Same validation as above
+    if (!result.key || !result.data?.hash) {
+      logger.error('❌ OpenRouter API response missing required fields', {
+        hasKey: !!result.key,
+        hasHash: !!result.data?.hash
+      });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.KEY_CREATION_FAILED,
+          message: 'OpenRouter API response missing required fields',
+          details: 'Missing key or hash in response'
+        }
+      };
+    }
+
+    // ✅ FIXED: Use correct field mapping
+    const openRouterKey = result.key;
+    const openRouterHash = result.data.hash;
+    
+    const encryptedKey = EncryptionUtils.encrypt(openRouterKey);
+    const ourKeyHash = EncryptionUtils.hashApiKey(openRouterKey);
+
+    // ✅ FIXED: Store with proper field mapping
+    const { error: dbError } = await supabase
+      .from('user_openrouter_keys')
+      .upsert({
+        user_id: userId,
+        openrouter_key_hash: openRouterHash,
+        our_key_hash: ourKeyHash,
+        encrypted_api_key: encryptedKey,
+        openrouter_credits: 0,
+        is_active: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+
+    if (dbError) {
+      logger.error({ msg: 'Failed to store zero-credit key in database', error: dbError });
+      
+      // Cleanup
+      try {
+        await fetch(`${this.baseUrl}/keys/${openRouterHash}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${this.provisioningKey}` }
+        });
+      } catch (cleanupError) {
+        logger.warn('Failed to cleanup key after database error');
+      }
+
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to store API key',
+          details: dbError
+        }
+      };
+    }
+
+    logger.info({ 
+      msg: 'Zero-credit OpenRouter API key created successfully', 
+      userId, 
+      openrouterHash: openRouterHash 
+    });
+
+    return {
+      success: true,
+      data: { key: openRouterKey }
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error creating zero-credit OpenRouter key', error: error.message });
+    return {
+      success: false,
+      error: {
+        code: OpenRouterError.INTERNAL_ERROR,
+        message: 'Internal error creating key',
+        details: error.message
+      }
+    };
+  }
+}
 
   /**
    * Create a new OpenRouter API key for a user
    */
   async createUserApiKey(
-    userId: string, 
-    name: string, 
-    creditLimit: number = 0,
-    supabase: SupabaseClient,
-    logger: FastifyBaseLogger
-  ): Promise<string> {
-    try {
-      logger.info({ msg: 'Creating OpenRouter API key', userId, name, creditLimit });
+  userId: string,
+  email: string,
+  creditLimit: number,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger
+): Promise<OpenRouterResponse<{ key: string; }>> {
+  try {
+    logger.info({ msg: 'Creating OpenRouter API key', userId, email, creditLimit });
 
-      const response = await fetch(this.baseUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.provisioningKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          name: name,
-          label: `user-${userId}`,
-          limit: creditLimit
-        })
+    const response = await fetch(`${this.baseUrl}/keys`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.provisioningKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: `AI Platform - ${email}`,
+        label: `user-${userId.substring(0, 8)}`,
+        limit: creditLimit
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error({ msg: 'Failed to create key', status: response.status, error: errorText });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.KEY_CREATION_FAILED,
+          message: `Failed to create key: ${response.status}`,
+          details: errorText
+        }
+      };
+    }
+
+    const result = await response.json() as OpenRouterKeyApiResponse;
+    
+    // ✅ DEBUG: Log the actual response structure
+    logger.info('OpenRouter API Response Structure:', {
+      hasKey: !!result.key,
+      hasData: !!result.data,
+      hasHash: !!result.data?.hash,
+      keyLength: result.key?.length,
+      hashValue: result.data?.hash
+    });
+
+    // ✅ VALIDATION: Ensure we have the required fields
+    if (!result.key) {
+      logger.error('❌ OpenRouter API did not return a key');
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.KEY_CREATION_FAILED,
+          message: 'OpenRouter API did not return a key',
+          details: 'Missing key in response'
+        }
+      };
+    }
+
+    if (!result.data?.hash) {
+      logger.error('❌ OpenRouter API did not return a hash');
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.KEY_CREATION_FAILED,
+          message: 'OpenRouter API did not return a hash',
+          details: 'Missing hash in response data'
+        }
+      };
+    }
+
+    // ✅ FIXED: Use correct field mapping
+    const openRouterKey = result.key; // Key is at root level
+    const openRouterHash = result.data.hash; // Hash is in data object
+    
+    // Encrypt the key for storage
+    const encryptedKey = EncryptionUtils.encrypt(openRouterKey);
+    const ourKeyHash = EncryptionUtils.hashApiKey(openRouterKey);
+
+    logger.info('🔐 Key encryption completed:', {
+      openRouterHash: openRouterHash,
+      ourKeyHashGenerated: !!ourKeyHash,
+      encryptedKeyGenerated: !!encryptedKey
+    });
+
+    // ✅ FIXED: Store in database with proper field mapping
+    const { error: dbError } = await supabase
+      .from('user_openrouter_keys')
+      .upsert({
+        user_id: userId,
+        openrouter_key_hash: openRouterHash, // ✅ Use hash from OpenRouter API
+        our_key_hash: ourKeyHash, // ✅ Our generated hash for internal use
+        encrypted_api_key: encryptedKey,
+        openrouter_credits: creditLimit,
+        is_active: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
       });
 
-      if (!response.ok) {
-        const errorData = await response.text();
-        logger.error({ msg: 'Failed to create OpenRouter key', status: response.status, error: errorData });
-        throw new Error(`Failed to create OpenRouter key: ${response.status} ${errorData}`);
-      }
-
-const result = await response.json() as CreateKeyResponse;      
-      // Encrypt and store the API key
-      const encryptedKey = EncryptionUtils.encrypt(result.key);
-      const keyHash = EncryptionUtils.hashApiKey(result.key);
-
-      const { error: dbError } = await supabase
-        .from('user_openrouter_keys')
-        .upsert({
-          user_id: userId,
-          openrouter_key_hash: keyHash,
-          encrypted_api_key: encryptedKey,
-          credit_limit: creditLimit,
-          usage_amount: 0,
-          is_active: true
+    if (dbError) {
+      logger.error({ msg: 'Failed to store key in database', error: dbError });
+      
+      // ✅ CLEANUP: Try to delete the created key from OpenRouter
+      try {
+        await fetch(`${this.baseUrl}/keys/${openRouterHash}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${this.provisioningKey}` }
         });
-
-      if (dbError) {
-        logger.error({ msg: 'Failed to store OpenRouter key in database', error: dbError });
-        // Try to clean up the created key
-        await this.deleteUserApiKey(result.data.hash, logger);
-        throw new Error('Failed to store API key in database');
+        logger.info('🧹 Cleaned up OpenRouter key after database error');
+      } catch (cleanupError) {
+        logger.warn('⚠️ Failed to cleanup OpenRouter key after database error');
       }
 
-      logger.info({ msg: 'OpenRouter API key created and stored successfully', userId, keyHash });
-      return result.key;
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to store API key',
+          details: dbError
+        }
+      };
+    }
+
+    logger.info({ 
+      msg: 'OpenRouter API key created and stored successfully', 
+      userId, 
+      openrouterHash: openRouterHash, 
+      creditLimit 
+    });
+
+    return {
+      success: true,
+      data: { key: openRouterKey }
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error creating OpenRouter key', error: error.message });
+    return {
+      success: false,
+      error: {
+        code: OpenRouterError.INTERNAL_ERROR,
+        message: 'Internal error creating key',
+        details: error.message
+      }
+    };
+  }
+}
+
+  /**
+   * Get user's API key for making requests
+   */
+  async getUserApiKey(
+    userId: string,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<OpenRouterResponse<string>> {
+    try {
+      const { data: keyData, error: keyError } = await supabase
+        .from('user_openrouter_keys')
+        .select('encrypted_api_key')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .single();
+
+      if (keyError || !keyData) {
+        logger.warn({ msg: 'No active API key found for user', userId });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.KEY_NOT_FOUND,
+            message: 'No active API key found'
+          }
+        };
+      }
+
+      const decryptedKey = EncryptionUtils.decrypt(keyData.encrypted_api_key);
+      return {
+        success: true,
+        data: decryptedKey
+      };
 
     } catch (error: any) {
-      logger.error({ msg: 'Error creating OpenRouter API key', error: error.message, userId });
-      throw error;
+      logger.error({ msg: 'Error getting user API key', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to retrieve API key',
+          details: error.message
+        }
+      };
     }
   }
 
   /**
-   * Update credit limit for a user's OpenRouter API key
+   * Check and sync user's credit usage
+   */
+  async syncUserCredits(
+    userId: string,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<OpenRouterResponse<KeyUsageInfo>> {
+    try {
+      // Get user's key
+      const keyResponse = await this.getUserApiKey(userId, supabase, logger);
+      if (!keyResponse.success) {
+        return {
+           success: false,
+           error: keyResponse.error // Propagate error from getUserApiKey
+        };
+      }
+
+      // Get usage from OpenRouter
+      const response = await fetch(`${this.baseUrl}/auth/key`, {
+        headers: {
+          'Authorization': `Bearer ${keyResponse.data}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error({ msg: 'Failed to get usage from OpenRouter', status: response.status, error: errorText });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.USAGE_SYNC_FAILED,
+            message: 'Failed to get usage from OpenRouter',
+            details: errorText
+          }
+        };
+      }
+
+      const usageData = await response.json() as KeyUsageInfo; // Cast to KeyUsageInfo
+      
+      // Update database
+      await supabase.rpc('sync_openrouter_credits', {
+        p_user_id: userId,
+        p_credits_used: usageData.usage || 0,
+        p_total_balance: usageData.limit || 0
+      });
+
+      logger.info({ msg: 'User usage synced successfully', userId, usage: usageData.usage, remaining: usageData.limit ? usageData.limit - usageData.usage : null });
+
+      return {
+        success: true,
+        data: {
+          usage: usageData.usage || 0,
+          limit: usageData.limit,
+          remaining: usageData.limit ? usageData.limit - usageData.usage : null,
+          disabled: usageData.disabled || false,
+          lastSynced: new Date().toISOString()
+        }
+      };
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error syncing user credits', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to sync credits',
+          details: error.message
+        }
+      };
+    }
+  }
+
+  /**
+   * Check if user has sufficient credits
+   */
+  async checkUserCredits(
+  userId: string,
+  requiredCredits: number,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger,
+  modelId?: string // Add optional model parameter
+): Promise<OpenRouterResponse<{ sufficient: boolean; available: number; isFreeModel?: boolean }>> {
+  try {
+    // If model doesn't require credits, allow access immediately
+    if (modelId && !this.checkModelRequiresCredits(modelId)) {
+      logger.info({ msg: 'Free model access granted', userId, modelId });
+      return {
+        success: true,
+        data: {
+          sufficient: true,
+          available: 0, // Free tier - no credit tracking needed
+          isFreeModel: true
+        }
+      };
+    }
+
+    // For paid models, perform credit check
+    // Sync first to get latest usage
+    const syncResult = await this.syncUserCredits(userId, supabase, logger);
+    if (!syncResult.success) {
+      return {
+        success: false,
+        error: syncResult.error
+      };
+    }
+
+    const { data: checkResult, error: rpcError } = await supabase.rpc('check_user_credits', {
+      p_user_id: userId,
+      p_required_credits: requiredCredits
+    }).single<CheckUserCreditsResult>();
+
+    if (rpcError) {
+      logger.error({ msg: 'Error calling check_user_credits RPC', error: rpcError });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to check credits via RPC',
+          details: rpcError.message
+        }
+      };
+    }
+
+    if (!checkResult || !checkResult.has_credits) {
+      // Enhanced error message with free model suggestions
+      const userApiKeyResponse = await this.getUserApiKey(userId, supabase, logger);
+      const userApiKey = userApiKeyResponse.success ? userApiKeyResponse.data : undefined;
+      const freeModels = await this.getAvailableFreeModels(userApiKey, logger);
+      
+      const errorMessage = checkResult?.error_message || 'Insufficient credits';
+      
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INSUFFICIENT_CREDITS,
+          message: `${errorMessage}. Try using a free model instead.`,
+          details: {
+            required: requiredCredits,
+            available: checkResult?.available_credits || 0,
+            freeModelsAvailable: freeModels,
+            suggestion: `Consider using a free model like: ${freeModels.slice(0, 3).join(', ')}`,
+            freeModelPattern: 'Models ending with ":free" don\'t require credits'
+          }
+        }
+      };
+    }
+
+    return {
+      success: true,
+      data: {
+        sufficient: true,
+        available: checkResult.available_credits,
+        isFreeModel: false
+      }
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error checking user credits', error: error.message });
+    return {
+      success: false,
+      error: {
+        code: OpenRouterError.INTERNAL_ERROR,
+        message: 'Failed to check credits',
+        details: error.message
+      }
+    };
+  }
+}
+
+  /**
+   * Check if model is allowed for user's plan
+   */
+  // Replace lines 350-423 in your checkModelAccess method:
+
+async checkModelAccess(
+  userId: string,
+  modelId: string,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger
+): Promise<OpenRouterResponse<boolean>> {
+  try {
+    // Free models are always allowed regardless of subscription
+    if (!this.checkModelRequiresCredits(modelId)) {
+      logger.info({ msg: 'Free model access granted', userId, modelId });
+      return {
+        success: true,
+        data: true
+      };
+    }
+
+    // For paid models, check subscription
+    const { data: subscription, error: subError } = await supabase
+      .from('user_subscriptions')
+      .select(`
+        subscription_plans (
+          id,
+          name,
+          free_models_only,
+          allowed_models
+        )
+      `)
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .single();
+
+    if (subError && subError.code !== 'PGRST116') {
+      logger.error({ msg: 'Error fetching user subscription', error: subError });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to check subscription',
+          details: subError.message
+        }
+      };
+    }
+
+    if (!subscription?.subscription_plans) {
+      // No active subscription - only free models allowed
+      const userApiKeyResponse = await this.getUserApiKey(userId, supabase, logger);
+      const userApiKey = userApiKeyResponse.success ? userApiKeyResponse.data : undefined;
+      const freeModels = await this.getAvailableFreeModels(userApiKey, logger);
+      
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.PLAN_RESTRICTION,
+          message: 'This model requires an active subscription. Try a free model instead.',
+          details: {
+            freeModelsAvailable: freeModels,
+            suggestion: `Consider using a free model like: ${freeModels.slice(0, 3).join(', ')}`,
+            freeModelPattern: 'Models ending with ":free" don\'t require a subscription'
+          }
+        }
+      };
+    }
+
+    // Handle subscription plan details
+    let plan: SubscriptionPlanDetails;
+    if (Array.isArray(subscription.subscription_plans)) {
+      if (subscription.subscription_plans.length === 0) {
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.PLAN_RESTRICTION,
+            message: 'No subscription plan found'
+          }
+        };
+      }
+      plan = subscription.subscription_plans[0] as SubscriptionPlanDetails;
+    } else {
+      plan = subscription.subscription_plans as SubscriptionPlanDetails;
+    }
+
+    // Check if plan only allows free models
+    if (plan.free_models_only) {
+      const userApiKeyResponse = await this.getUserApiKey(userId, supabase, logger);
+      const userApiKey = userApiKeyResponse.success ? userApiKeyResponse.data : undefined;
+      const freeModels = await this.getAvailableFreeModels(userApiKey, logger);
+      
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.MODEL_NOT_ALLOWED,
+          message: 'Your plan only allows free models. Upgrade to access paid models.',
+          details: {
+            currentPlan: plan.name,
+            freeModelsAvailable: freeModels,
+            suggestion: `Consider using a free model like: ${freeModels.slice(0, 3).join(', ')}`,
+            freeModelPattern: 'Models ending with ":free" are included in your plan'
+          }
+        }
+      };
+    }
+
+    // Check if model is in allowed_models list
+    if (plan.allowed_models && !plan.allowed_models.includes(modelId)) {
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.MODEL_NOT_ALLOWED,
+          message: 'Model not available in current plan',
+          details: {
+            currentPlan: plan.name,
+            allowedModels: plan.allowed_models
+          }
+        }
+      };
+    }
+
+    return {
+      success: true,
+      data: true
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error checking model access', error: error.message });
+    return {
+      success: false,
+      error: {
+        code: OpenRouterError.INTERNAL_ERROR,
+        message: 'Failed to check model access',
+        details: error.message
+      }
+    };
+  }
+}
+
+  /**
+   * Allocate credits to user's OpenRouter key (for subscriptions and top-ups)
+   */
+  async allocateCreditsToUser(
+    userId: string,
+    additionalCredits: number,
+    source: string,
+    sourceReference: string,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<OpenRouterResponse<{ newTotal: number }>> {
+    try {
+      // Get current credit limit
+      const { data: keyData, error: keyError } = await supabase
+        .from('user_openrouter_keys')
+        .select('openrouter_credits')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .single();
+
+      if (keyError || !keyData) {
+        logger.warn({ msg: 'No active OpenRouter key found for credit allocation', userId });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.KEY_NOT_FOUND,
+            message: 'No active key found for credit allocation'
+          }
+        };
+      }
+
+      const newTotalCredits = keyData.openrouter_credits + additionalCredits;
+
+      // Log allocation attempt
+      const { error: logError } = await supabase
+        .from('credit_allocation_log')
+        .insert({
+          user_id: userId,
+          amount: additionalCredits,
+          source: source,
+          source_reference: sourceReference,
+          status: 'processing'
+        });
+
+      if (logError) {
+        logger.error({ msg: 'Failed to log credit allocation', error: logError });
+      }
+
+      // Update OpenRouter key limit
+      const updateResponse = await this.updateUserKeyLimit(userId, newTotalCredits, supabase, logger);
+      
+      if (!updateResponse.success) {
+        // Mark allocation as failed
+        await supabase
+          .from('credit_allocation_log')
+          .update({
+            status: 'failed',
+            error: updateResponse.error?.message,
+            updated_at: new Date().toISOString()
+          })
+          .eq('user_id', userId)
+          .eq('source_reference', sourceReference);
+
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.CREDIT_ALLOCATION_FAILED,
+            message: 'Failed to allocate credits to OpenRouter key',
+            details: updateResponse.error
+          }
+        };
+      }
+
+      // Mark allocation as successful
+      await supabase
+        .from('credit_allocation_log')
+        .update({
+          status: 'completed',
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .eq('source_reference', sourceReference);
+
+      logger.info({
+        msg: 'Credits allocated successfully',
+        userId,
+        additionalCredits,
+        newTotalCredits,
+        source,
+        sourceReference
+      });
+
+      return {
+        success: true,
+        data: { newTotal: newTotalCredits }
+      };
+
+    } catch (error: any) {
+      logger.error({ msg: 'Error allocating credits', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Internal error allocating credits',
+          details: error.message
+        }
+      };
+    }
+  }
+
+  /**
+   * Update credit limit for user's OpenRouter key
    */
   async updateUserKeyLimit(
     userId: string,
     newLimit: number,
     supabase: SupabaseClient,
     logger: FastifyBaseLogger
-  ): Promise<boolean> {
+  ): Promise<OpenRouterResponse<void>> {
     try {
-      // Get user's current key
-      const { data: keyData, error: fetchError } = await supabase
+      const { data: keyData, error: keyError } = await supabase
         .from('user_openrouter_keys')
-        .select('openrouter_key_hash, encrypted_api_key')
+        .select('openrouter_key_hash')
         .eq('user_id', userId)
         .eq('is_active', true)
         .single();
 
-      if (fetchError || !keyData) {
-        logger.warn({ msg: 'No active OpenRouter key found for user', userId });
-        return false;
+      if (keyError || !keyData) {
+        logger.warn({ msg: 'No active OpenRouter key found for user to update limit', userId });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.KEY_NOT_FOUND,
+            message: 'No active key found to update limit'
+          }
+        };
       }
 
-      // Get the actual key hash from OpenRouter (we need to map our hash to their hash)
-      const decryptedKey = EncryptionUtils.decrypt(keyData.encrypted_api_key);
-      const keyHash = await this.getKeyHashFromOpenRouter(decryptedKey, logger);
-
-      if (!keyHash) {
-        logger.error({ msg: 'Could not find key hash in OpenRouter', userId });
-        return false;
-      }
-
-      // Update the key limit in OpenRouter
-      const response = await fetch(`${this.baseUrl}/${keyHash}`, {
+      const response = await fetch(`${this.baseUrl}/keys/${keyData.openrouter_key_hash}`, {
         method: 'PATCH',
         headers: {
           'Authorization': `Bearer ${this.provisioningKey}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          limit: newLimit
-        })
+        body: JSON.stringify({ limit: newLimit })
       });
 
       if (!response.ok) {
-        const errorData = await response.text();
-        logger.error({ msg: 'Failed to update OpenRouter key limit', status: response.status, error: errorData });
-        return false;
+        const errorText = await response.text();
+        logger.error({ msg: 'Failed to update key limit in OpenRouter', status: response.status, error: errorText });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.LIMIT_UPDATE_FAILED,
+            message: 'Failed to update key limit in OpenRouter',
+            details: errorText
+          }
+        };
       }
 
-      // Update our database record
-      const { error: updateError } = await supabase
+      // Update our database
+      const { error: dbError } = await supabase
         .from('user_openrouter_keys')
-        .update({ 
-          credit_limit: newLimit,
+        .update({
+          openrouter_credits: newLimit,
           updated_at: new Date().toISOString()
         })
         .eq('user_id', userId);
 
-      if (updateError) {
-        logger.error({ msg: 'Failed to update key limit in database', error: updateError });
-        return false;
+      if (dbError) {
+        logger.error({ msg: 'Failed to update key limit in database', error: dbError });
+        // Note: OpenRouter limit was updated, but DB failed. This needs monitoring.
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.INTERNAL_ERROR,
+            message: 'Failed to update key limit in database',
+            details: dbError.message
+          }
+        };
       }
 
       logger.info({ msg: 'OpenRouter key limit updated successfully', userId, newLimit });
-      return true;
+      return { success: true };
 
     } catch (error: any) {
-      logger.error({ msg: 'Error updating OpenRouter key limit', error: error.message, userId });
-      return false;
+      logger.error({ msg: 'Error updating key limit', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Internal error updating limit',
+          details: error.message
+        }
+      };
     }
   }
 
   /**
-   * Get OpenRouter key information by searching for the key
+   * Create or ensure user has an OpenRouter API key with proper credit allocation
    */
-  private async getKeyHashFromOpenRouter(apiKey: string, logger: FastifyBaseLogger): Promise<string | null> {
+  async ensureUserApiKey(
+    userId: string,
+    email: string,
+    creditLimit: number,
+    supabase: SupabaseClient,
+    logger: FastifyBaseLogger
+  ): Promise<OpenRouterResponse<string>> {
     try {
-      // List keys and find the one that matches
-      const response = await fetch(this.baseUrl, {
-        headers: {
-          'Authorization': `Bearer ${this.provisioningKey}`,
-          'Content-Type': 'application/json'
+      // Check if user already has an active key
+      const apiKeyResponse = await this.getUserApiKey(userId, supabase, logger);
+      
+      if (apiKeyResponse.success) {
+        // Key exists, ensure limit is correct and sync usage
+        const updateLimitResponse = await this.updateUserKeyLimit(userId, creditLimit, supabase, logger);
+        if (!updateLimitResponse.success) {
+           // Log error but don't necessarily fail the ensure process if key exists
+           logger.error({ msg: 'Failed to update limit during ensure', userId, error: updateLimitResponse.error });
         }
-      });
-
-      if (!response.ok) {
-        return null;
+        const syncResponse = await this.syncUserCredits(userId, supabase, logger);
+         if (!syncResponse.success) {
+           // Log error but don't necessarily fail the ensure process if key exists
+           logger.error({ msg: 'Failed to sync usage during ensure', userId, error: syncResponse.error });
+        }
+        return apiKeyResponse;
       }
 
-      const result = await response.json();
-      
-      // We can't directly match the key, but we can match by label
-      const keyHash = EncryptionUtils.hashApiKey(apiKey);
-      // This is a limitation - we'll store the OpenRouter hash when we create the key
-      // For now, we'll need to implement a different approach
-      
-      return null; // TODO: Implement proper key hash lookup
+      // Key does not exist, create new key
+      const createKeyResponse = await this.createUserApiKey(
+        userId,
+        email,
+        creditLimit,
+        supabase,
+        logger
+      );
+
+      if (!createKeyResponse.success) {
+        return {
+           success: false,
+           error: createKeyResponse.error // Propagate creation error
+        };
+      }
+
+      return {
+        success: true,
+        data: createKeyResponse.data!.key
+      };
+
     } catch (error: any) {
-      logger.error({ msg: 'Error searching OpenRouter keys', error: error.message });
-      return null;
+      logger.error({ msg: 'Error ensuring user API key', error: error.message, userId });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Internal error ensuring key',
+          details: error.message
+        }
+      };
     }
   }
 
@@ -205,7 +1027,7 @@ const result = await response.json() as CreateKeyResponse;
     userId: string,
     supabase: SupabaseClient,
     logger: FastifyBaseLogger
-  ): Promise<boolean> {
+  ): Promise<OpenRouterResponse<void>> {
     try {
       const { data: keyData, error: fetchError } = await supabase
         .from('user_openrouter_keys')
@@ -215,11 +1037,35 @@ const result = await response.json() as CreateKeyResponse;
         .single();
 
       if (fetchError || !keyData) {
-        logger.warn({ msg: 'No active OpenRouter key found for user', userId });
-        return false;
+        logger.warn({ msg: 'No active OpenRouter key found for user to disable', userId });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.KEY_NOT_FOUND,
+            message: 'No active key found to disable'
+          }
+        };
       }
 
-      // We'll update in our database for now
+      // Disable key in OpenRouter
+      const response = await fetch(`${this.baseUrl}/keys/${keyData.openrouter_key_hash}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${this.provisioningKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          disabled: true
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error({ msg: 'Failed to disable key in OpenRouter', status: response.status, error: errorText });
+        // Continue to update DB even if OpenRouter fails
+      }
+
+      // Update in our database
       const { error: updateError } = await supabase
         .from('user_openrouter_keys')
         .update({ 
@@ -230,24 +1076,38 @@ const result = await response.json() as CreateKeyResponse;
 
       if (updateError) {
         logger.error({ msg: 'Failed to disable key in database', error: updateError });
-        return false;
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.INTERNAL_ERROR,
+            message: 'Failed to disable key in database',
+            details: updateError.message
+          }
+        };
       }
 
       logger.info({ msg: 'OpenRouter key disabled successfully', userId });
-      return true;
+      return { success: true };
 
     } catch (error: any) {
       logger.error({ msg: 'Error disabling OpenRouter key', error: error.message, userId });
-      return false;
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Internal error disabling key',
+          details: error.message
+        }
+      };
     }
   }
 
   /**
    * Delete a user's OpenRouter API key
    */
-  async deleteUserApiKey(keyHash: string, logger: FastifyBaseLogger): Promise<boolean> {
+  async deleteUserApiKey(keyHash: string, logger: FastifyBaseLogger): Promise<OpenRouterResponse<void>> {
     try {
-      const response = await fetch(`${this.baseUrl}/${keyHash}`, {
+      const response = await fetch(`${this.baseUrl}/keys/${keyHash}`, {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${this.provisioningKey}`,
@@ -258,81 +1118,165 @@ const result = await response.json() as CreateKeyResponse;
       if (!response.ok) {
         const errorData = await response.text();
         logger.error({ msg: 'Failed to delete OpenRouter key', status: response.status, error: errorData });
-        return false;
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.INTERNAL_ERROR,
+            message: 'Failed to delete key in OpenRouter',
+            details: errorData
+          }
+        };
       }
 
+      // Note: We don't delete from our DB, just mark inactive/deleted if needed elsewhere.
+      // Assuming deletion from OpenRouter is sufficient for this context.
+
       logger.info({ msg: 'OpenRouter key deleted successfully', keyHash });
-      return true;
+      return { success: true };
 
     } catch (error: any) {
       logger.error({ msg: 'Error deleting OpenRouter key', error: error.message, keyHash });
-      return false;
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Internal error deleting key',
+          details: error.message
+        }
+      };
     }
   }
 
   /**
-   * Get user's decrypted API key for making requests
+   * Compare OpenRouter credits with local database and auto-sync if needed
    */
-  async getUserApiKey(
+  async compareAndSyncCredits(
     userId: string,
     supabase: SupabaseClient,
     logger: FastifyBaseLogger
-  ): Promise<string | null> {
+  ): Promise<OpenRouterResponse<{
+    openrouterCredits: number;
+    localCredits: number;
+    synced: boolean;
+    action: string;
+  }>> {
     try {
-      const { data: keyData, error: fetchError } = await supabase
-        .from('user_openrouter_keys')
-        .select('encrypted_api_key')
+      // Get local credit data
+      const { data: localData, error: localError } = await supabase
+        .from('user_credit_balances')
+        .select('openrouter_balance, openrouter_total_used, openrouter_last_sync')
         .eq('user_id', userId)
-        .eq('is_active', true)
         .single();
 
-      if (fetchError || !keyData) {
-        logger.warn({ msg: 'No active OpenRouter key found for user', userId });
-        return null;
+      if (localError) {
+        logger.error({ msg: 'Failed to get local credit data', error: localError });
+        return {
+          success: false,
+          error: {
+            code: OpenRouterError.INTERNAL_ERROR,
+            message: 'Failed to get local credit data',
+            details: localError.message
+          }
+        };
       }
 
-      return EncryptionUtils.decrypt(keyData.encrypted_api_key);
+      // Get OpenRouter usage
+      const syncResult = await this.syncUserCredits(userId, supabase, logger);
+      if (!syncResult.success) {
+        return {
+          success: false,
+          error: syncResult.error
+        };
+      }
+
+      const openrouterData = syncResult.data!;
+      const localBalance = localData?.openrouter_balance || 0;
+      const openrouterBalance = openrouterData.remaining || 0;
+
+      let action = 'no_action_needed';
+      let synced = true;
+
+      // Compare and decide action
+      if (Math.abs(localBalance - openrouterBalance) > 1) { // Allow 1 credit difference for rounding
+        if (openrouterBalance > localBalance) {
+          action = 'local_updated_from_openrouter';
+          logger.info({
+            msg: 'Local credits updated from OpenRouter',
+            userId,
+            localBalance,
+            openrouterBalance
+          });
+        } else {
+          action = 'openrouter_updated_from_local';
+          // Update OpenRouter to match local if local is higher
+          if (localBalance > openrouterBalance) {
+            const updateResponse = await this.updateUserKeyLimit(userId, localBalance, supabase, logger);
+            synced = updateResponse.success;
+            if (!synced) {
+              logger.warn({
+                msg: 'Failed to update OpenRouter to match local',
+                userId,
+                localBalance,
+                openrouterBalance
+              });
+            }
+          }
+        }
+      }
+
+      return {
+        success: true,
+        data: {
+          openrouterCredits: openrouterBalance,
+          localCredits: localBalance,
+          synced,
+          action
+        }
+      };
 
     } catch (error: any) {
-      logger.error({ msg: 'Error retrieving user API key', error: error.message, userId });
-      return null;
+      logger.error({ msg: 'Error comparing and syncing credits', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to compare and sync credits',
+          details: error.message
+        }
+      };
     }
   }
 
   /**
-   * Create or ensure user has an OpenRouter API key
+   * Get comprehensive user key information
    */
-  async ensureUserApiKey(
+  async getUserKeyInfo(
     userId: string,
-    email: string,
-    creditLimit: number,
     supabase: SupabaseClient,
     logger: FastifyBaseLogger
-  ): Promise<string | null> {
+  ): Promise<OpenRouterResponse<KeyUsageInfo>> {
     try {
-      // Check if user already has an active key
-      let apiKey = await this.getUserApiKey(userId, supabase, logger);
-      
-      if (apiKey) {
-        // Update the credit limit if needed
-        await this.updateUserKeyLimit(userId, creditLimit, supabase, logger);
-        return apiKey;
+      // Sync first to get latest usage
+      const syncResult = await this.syncUserCredits(userId, supabase, logger);
+      if (!syncResult.success) {
+        return syncResult;
       }
 
-      // Create new key
-      apiKey = await this.createUserApiKey(
-        userId,
-        `AI Platform Key - ${email}`,
-        creditLimit,
-        supabase,
-        logger
-      );
-
-      return apiKey;
+      return {
+        success: true,
+        data: syncResult.data!
+      };
 
     } catch (error: any) {
-      logger.error({ msg: 'Error ensuring user API key', error: error.message, userId });
-      return null;
+      logger.error({ msg: 'Error getting user key info', error: error.message });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.INTERNAL_ERROR,
+          message: 'Failed to get key info',
+          details: error.message
+        }
+      };
     }
   }
 }
