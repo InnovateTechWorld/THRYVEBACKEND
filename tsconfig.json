@@ -10,9 +10,8 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
+    "declaration": false,
+    "sourceMap": false,
     "typeRoots": [
       "./node_modules/@types",
       "./src/types"
@@ -28,9 +27,5 @@
   "exclude": [
     "node_modules",
     "dist"
-  ],
-  "ts-node": {
-    "esm": false,
-    "experimentalSpecifierResolution": "node"
-  }
+  ]
 }
