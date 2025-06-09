@@ -687,32 +687,60 @@ fastify.log.info('✅ Transaction found successfully:', {
       }
 
       // Check if it's a free plan
-      if (plan.price === 0) {
-        // Free plan - activate immediately
-        const { error: subError } = await supabase
-  .from('user_subscriptions')
-  .upsert({
-    user_id: userId,
-    plan_id: planId,
-    status: 'active',
-    // ❌ REMOVED: is_active: true (column doesn't exist)
-    current_period_start: new Date().toISOString(),
-    current_period_end: null, // Free plan doesn't expire
-    updated_at: new Date().toISOString()
-  }, {
-    onConflict: 'user_id'
-  });
+if (plan.price === 0) {
+  // Free plan - activate immediately
+  const { error: subError } = await supabase
+    .from('user_subscriptions')
+    .upsert({
+      user_id: userId,
+      plan_id: planId,
+      status: 'active',
+      current_period_start: new Date().toISOString(),
+      current_period_end: null, // Free plan doesn't expire
+      updated_at: new Date().toISOString()
+    }, {
+      onConflict: 'user_id'
+    });
 
-        if (subError) {
-          fastify.log.error({ msg: 'Failed to activate free plan', error: subError });
-          return reply.code(500).send({ error: 'Failed to activate subscription' });
-        }
+  if (subError) {
+    fastify.log.error({ msg: 'Failed to activate free plan', error: subError });
+    return reply.code(500).send({ error: 'Failed to activate subscription' });
+  }
 
-        return reply.send({
-          success: true,
-          message: 'Free plan activated successfully',
-          data: { planId, status: 'active' }
+  // ✅ ADDED: Create OpenRouter key for free plan users
+  try {
+    const userEmail = request.user.email;
+    if (userEmail) {
+      fastify.log.info('🔑 Creating OpenRouter key for free plan user:', { userId, planId });
+      
+      const createResponse = await openRouterManager.createUserApiKeyWithZeroCredits(
+        userId,
+        userEmail,
+        supabase,
+        fastify.log
+      );
+
+      if (createResponse.success) {
+        fastify.log.info('✅ OpenRouter key created for free plan user:', { userId });
+      } else {
+        fastify.log.warn('⚠️ Failed to create OpenRouter key for free plan user:', { 
+          userId, 
+          error: createResponse.error 
         });
+      }
+    }
+  } catch (openRouterError: any) {
+    fastify.log.warn('⚠️ OpenRouter key creation failed for free plan:', {
+      userId,
+      error: openRouterError.message
+    });
+  }
+
+  return reply.send({
+    success: true,
+    message: 'Free plan activated successfully',
+    data: { planId, status: 'active' }
+  });
       }
 
       // Paid plan - return payment initiation info
@@ -1150,6 +1178,8 @@ fastify.post('/api/payment/create-openrouter-key', {
  
 // Replace the processSubscriptionPayment function around line 900 with this fixed version:
 
+// Replace your processSubscriptionPayment function completely with this fixed version:
+
 async function processSubscriptionPayment(
   transaction: any,
   userId: string,
@@ -1222,13 +1252,23 @@ async function processSubscriptionPayment(
       planCredits: plan.credits
     });
 
-    // ✅ FIX 3: Create or update subscription
+    // ✅ FIX 3: Create or update subscription with correct fields
+    const subscriptionData = {
+      user_id: userId,
+      plan_id: transaction.plan_id,
+      status: 'active',
+      current_period_start: new Date().toISOString(),
+      current_period_end: calculatePeriodEnd(plan.billing_cycle || 'monthly'),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
     const { data: subscriptionResult, error: subscriptionError } = await supabase
-      .rpc('create_or_update_subscription', {
-        p_user_id: userId,
-        p_plan_id: transaction.plan_id,
-        p_transaction_id: transaction.id
-      });
+      .from('user_subscriptions')
+      .upsert(subscriptionData, {
+        onConflict: 'user_id'
+      })
+      .select('*');
 
     if (subscriptionError) {
       logger.error('❌ Failed to create/update subscription:', subscriptionError);
@@ -1241,81 +1281,90 @@ async function processSubscriptionPayment(
       subscriptionResult
     });
 
-    // ✅ FIX 4: Add credits if plan includes them
+    // ✅ FIX 4: Handle credits and OpenRouter key for ALL plans
     const creditAmount = parseFloat(plan.credits) || 0;
     
+    logger.info('🎯 Processing subscription plan credits:', {
+      userId,
+      planName: plan.name,
+      planPrice: plan.price,
+      creditAmount,
+      isFreeplan: plan.price === 0
+    });
+
     if (creditAmount > 0) {
-      logger.info('🎯 Adding credits to user account:', {
+      // PAID PLAN WITH CREDITS
+      logger.info('💰 Processing paid plan with credits:', {
         userId,
         creditAmount,
         planName: plan.name
       });
 
       const { data: currentCredits } = await supabase
-    .from('user_credit_balances')
-    .select('available_credits, total_purchased, total_used')
-    .eq('user_id', userId)
-    .single();
+        .from('user_credit_balances')
+        .select('available_credits, total_purchased, total_used')
+        .eq('user_id', userId)
+        .single();
 
-  // ✅ Calculate new amounts
-  const newAvailableCredits = (currentCredits?.available_credits || 0) + creditAmount;
-  const newTotalPurchased = (currentCredits?.total_purchased || 0) + creditAmount;
+      // Calculate new amounts
+      const newAvailableCredits = (currentCredits?.available_credits || 0) + creditAmount;
+      const newTotalPurchased = (currentCredits?.total_purchased || 0) + creditAmount;
 
-  // ✅ Update credit balance
-  const { data: creditResult, error: creditsError } = await supabase
-    .from('user_credit_balances')
-    .upsert({
-      user_id: userId,
-      available_credits: newAvailableCredits,
-      total_purchased: newTotalPurchased,
-      total_used: currentCredits?.total_used || 0,
-      updated_at: new Date().toISOString()
-    }, {
-      onConflict: 'user_id'
-    })
-    .select('*');
+      // Update credit balance
+      const { data: creditResult, error: creditsError } = await supabase
+        .from('user_credit_balances')
+        .upsert({
+          user_id: userId,
+          available_credits: newAvailableCredits,
+          total_purchased: newTotalPurchased,
+          total_used: currentCredits?.total_used || 0,
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'user_id'
+        })
+        .select('*');
 
-  if (creditsError) {
-    logger.error('❌ Credits update failed:', creditsError);
-    throw creditsError;
-  }
+      if (creditsError) {
+        logger.error('❌ Credits update failed:', creditsError);
+        throw creditsError;
+      }
 
-  // ✅ Log the credit transaction
-  const { error: transactionError } = await supabase
-    .from('credit_transactions')
-    .insert({
-      user_id: userId,
-      amount: creditAmount,
-      transaction_type: 'purchase',
-      source: 'subscription',
-      reference: transaction.id,
-      balance_after: newAvailableCredits,
-      created_at: new Date().toISOString()
-    });
+      // Log the credit transaction
+      const { error: transactionError } = await supabase
+        .from('credit_transactions')
+        .insert({
+          user_id: userId,
+          amount: creditAmount,
+          transaction_type: 'purchase',
+          source: 'subscription',
+          reference: transaction.id,
+          balance_after: newAvailableCredits,
+          created_at: new Date().toISOString()
+        });
 
-  if (transactionError) {
-    logger.warn('Failed to log credit transaction:', transactionError);
-    // Don't throw - credit update was successful
-  }
+      if (transactionError) {
+        logger.warn('Failed to log credit transaction:', transactionError);
+        // Don't throw - credit update was successful
+      }
 
-  logger.info('✅ Subscription credits updated successfully:', {
-    userId,
-    creditsAdded: creditAmount,
-    newAvailableCredits: creditResult[0]?.available_credits,
-    newTotalPurchased: creditResult[0]?.total_purchased
-  });
+      logger.info('✅ Subscription credits updated successfully:', {
+        userId,
+        creditsAdded: creditAmount,
+        newAvailableCredits: creditResult[0]?.available_credits,
+        newTotalPurchased: creditResult[0]?.total_purchased
+      });
 
-      // ✅ FIX 5: Create/Update OpenRouter key with new credit limit
+      // ✅ FIX 5: Create OpenRouter key with credits for PAID plans
       try {
-        const openRouterManager = new OpenRouterManager(process.env.OPENROUTER_PROVISIONING_KEY!);
+        const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
         
-        logger.info('🔑 Creating/updating OpenRouter key for subscription:', {
+        logger.info('🔑 Creating/updating OpenRouter key for paid subscription:', {
           userId,
           userEmail: userEmail.substring(0, 3) + '***' + userEmail.substring(userEmail.length - 4),
           newCreditLimit: creditResult[0]?.available_credits
         });
 
-        // Ensure user has an OpenRouter key with proper credit limit
+        // ✅ CRITICAL: Use ensureUserApiKey to create OR update existing key
         const ensureResponse = await openRouterManager.ensureUserApiKey(
           userId,
           userEmail,
@@ -1325,54 +1374,93 @@ async function processSubscriptionPayment(
         );
 
         if (!ensureResponse.success) {
-          logger.error('❌ OpenRouter key setup failed:', {
+          logger.error('❌ OpenRouter key setup failed for paid plan:', {
             userId,
             error: ensureResponse.error
           });
           // Don't throw - subscription was successful, OpenRouter can be fixed later
         } else {
-          logger.info('✅ OpenRouter key setup completed successfully:', { userId });
+          logger.info('✅ OpenRouter key setup completed successfully for paid plan:', { userId });
         }
 
       } catch (openRouterError: any) {
-        logger.error('❌ OpenRouter integration failed during subscription:', {
+        logger.error('❌ OpenRouter integration failed during paid subscription:', {
           userId,
           error: openRouterError.message,
           creditAmount
         });
         // Don't throw - subscription was successful
       }
-    } else {
-      logger.info('ℹ️ No credits included in this subscription plan (Free plan)');
-      
-      // ✅ For free plans, ensure user has a zero-credit OpenRouter key
+
+    } else if (plan.price === 0) {
+      // FREE PLAN - Create zero-credit OpenRouter key
+      logger.info('🆓 Processing free plan subscription:', {
+        userId,
+        planName: plan.name
+      });
+
       try {
-        const openRouterManager = new OpenRouterManager(process.env.OPENROUTER_PROVISIONING_KEY!);
+        const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
         
-        logger.info('🔑 Ensuring zero-credit OpenRouter key for free plan:', {
+        logger.info('🔑 Creating zero-credit OpenRouter key for free plan:', {
           userId,
           userEmail: userEmail.substring(0, 3) + '***' + userEmail.substring(userEmail.length - 4)
         });
 
+        // ✅ Use createUserApiKeyWithZeroCredits for free plans
+        const createResponse = await openRouterManager.createUserApiKeyWithZeroCredits(
+          userId,
+          userEmail,
+          supabase,
+          logger
+        );
+
+        if (!createResponse.success) {
+          logger.warn('⚠️ Failed to create OpenRouter key for free plan:', {
+            userId,
+            error: createResponse.error
+          });
+        } else {
+          logger.info('✅ OpenRouter key created successfully for free plan:', { userId });
+        }
+
+      } catch (openRouterError: any) {
+        logger.warn('⚠️ OpenRouter key setup failed for free plan:', {
+          userId,
+          error: openRouterError.message
+        });
+      }
+
+    } else {
+      // PAID PLAN WITH NO CREDITS (shouldn't happen but handle it)
+      logger.warn('⚠️ Paid plan with no credits - creating basic OpenRouter key:', {
+        userId,
+        planName: plan.name,
+        planPrice: plan.price
+      });
+
+      try {
+        const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
+        
         const ensureResponse = await openRouterManager.ensureUserApiKey(
           userId,
           userEmail,
-          0, // Zero credits for free plan
+          0, // No credits for this edge case
           supabase,
           logger
         );
 
         if (!ensureResponse.success) {
-          logger.warn('⚠️ Failed to ensure OpenRouter key for free plan:', {
+          logger.warn('⚠️ Failed to ensure OpenRouter key for no-credit paid plan:', {
             userId,
             error: ensureResponse.error
           });
         } else {
-          logger.info('✅ OpenRouter key ensured for free plan:', { userId });
+          logger.info('✅ OpenRouter key ensured for no-credit paid plan:', { userId });
         }
 
       } catch (openRouterError: any) {
-        logger.warn('⚠️ OpenRouter key setup failed for free plan:', {
+        logger.warn('⚠️ OpenRouter key setup failed for no-credit paid plan:', {
           userId,
           error: openRouterError.message
         });
@@ -1415,18 +1503,49 @@ async function processSubscriptionPayment(
       type: transaction.type
     });
 
-    // Get user email for OpenRouter operations
-    const { data: userProfile, error: userError } = await supabase.auth.getUser();
-    const userEmail = userProfile?.user?.email;
+    // ✅ FIX 1: Get user email correctly (same approach as subscription processing)
+    let userEmail = '';
     
-    if (!userEmail) {
-      logger.error('❌ User email missing for OpenRouter topup:', { userId });
-      throw new Error(PaymentError.USER_EMAIL_MISSING);
+    // Try getting from users table first
+    const { data: userProfile, error: profileError } = await supabase
+      .from('users')
+      .select('email')
+      .eq('id', userId)
+      .single();
+
+    if (userProfile?.email) {
+      userEmail = userProfile.email;
+      logger.info('✅ Got user email from users table for topup:', { 
+        userId, 
+        email: userEmail.substring(0, 3) + '***' + userEmail.substring(userEmail.length - 4) 
+      });
+    } else {
+      logger.warn('⚠️ User email not found in users table, trying auth table for topup:', { 
+        userId, 
+        profileError 
+      });
+      
+      // Fallback: Try getting from auth.users table
+      const { data: authUserData, error: authError } = await supabase.auth.admin.getUserById(userId);
+      
+      if (authUserData?.user?.email) {
+        userEmail = authUserData.user.email;
+        logger.info('✅ Got user email from auth table for topup:', { 
+          userId, 
+          email: userEmail.substring(0, 3) + '***' + userEmail.substring(userEmail.length - 4) 
+        });
+      } else {
+        logger.error('❌ Could not retrieve user email from any source for topup:', { 
+          userId, 
+          authError 
+        });
+        throw new Error('User email not found - cannot process topup');
+      }
     }
 
-    // ✅ FIXED: Use correct table name 'user_credit_balances' (not 'user_credits')
+    // ✅ Get current credits
     const { data: currentCredits } = await supabase
-      .from('user_credit_balances') // ✅ FIXED: Correct table name
+      .from('user_credit_balances')
       .select('available_credits, total_purchased, total_used')
       .eq('user_id', userId)
       .single();
@@ -1435,6 +1554,7 @@ async function processSubscriptionPayment(
     console.log('Current Credits:', currentCredits);
     console.log('Credit Amount to Add:', transaction.credit_amount);
     console.log('Credit Amount (openrouter):', transaction.openrouter_credit_amount);
+    console.log('User Email Found:', !!userEmail);
     console.log('================================');
 
     // Calculate new amounts
@@ -1442,14 +1562,14 @@ async function processSubscriptionPayment(
     const newAvailableCredits = (currentCredits?.available_credits || 0) + creditAmount;
     const newTotalPurchased = (currentCredits?.total_purchased || 0) + creditAmount;
 
-    // ✅ FIXED: Update user_credit_balances table with correct field names
+    // ✅ Update user_credit_balances table
     const { data: updatedCredits, error: creditsError } = await supabase
-      .from('user_credit_balances') // ✅ FIXED: Correct table name
+      .from('user_credit_balances')
       .upsert({
         user_id: userId,
-        available_credits: newAvailableCredits, // ✅ FIXED: Correct field name
-        total_purchased: newTotalPurchased,     // ✅ FIXED: Correct field name
-        total_used: currentCredits?.total_used || 0, // Keep existing usage
+        available_credits: newAvailableCredits,
+        total_purchased: newTotalPurchased,
+        total_used: currentCredits?.total_used || 0,
         updated_at: new Date().toISOString()
       }, {
         onConflict: 'user_id'
@@ -1479,79 +1599,107 @@ async function processSubscriptionPayment(
       updatedCredits: updatedCredits[0]
     });
 
-    // ✅ NEW: Update OpenRouter key limit after successful credit topup
+    // ✅ Log the credit transaction
+    const { error: transactionError } = await supabase
+      .from('credit_transactions')
+      .insert({
+        user_id: userId,
+        amount: creditAmount,
+        transaction_type: 'purchase',
+        source: 'topup',
+        reference: transaction.id,
+        balance_after: newAvailableCredits,
+        created_at: new Date().toISOString()
+      });
+
+    if (transactionError) {
+      logger.warn('Failed to log credit transaction for topup:', transactionError);
+      // Don't throw - credit update was successful
+    }
+
+    // ✅ FIX 2: Update OpenRouter key limit after successful credit topup
     try {
-      const openRouterManager = new OpenRouterManager(process.env.OPENROUTER_PROVISIONING_KEY!);
-      
       logger.info('🔑 Updating OpenRouter key for credit topup:', {
         userId,
-        userEmail,
+        userEmail: userEmail.substring(0, 3) + '***' + userEmail.substring(userEmail.length - 4),
         creditAmount,
         newCreditLimit: newAvailableCredits
       });
 
-      // Allocate additional credits to user's OpenRouter key
-      const allocationResponse = await openRouterManager.allocateCreditsToUser(
+      // ✅ Use ensureUserApiKey to update the credit limit
+      const ensureResponse = await openRouterManager.ensureUserApiKey(
         userId,
-        creditAmount,
-        'topup',
-        transaction.id,
+        userEmail,
+        newAvailableCredits, // Set the new total credit limit
         supabase,
         logger
       );
 
-      if (!allocationResponse.success) {
-        logger.error('❌ OpenRouter credit allocation failed for topup:', {
+      if (!ensureResponse.success) {
+        logger.error('❌ OpenRouter credit update failed for topup:', {
           userId,
-          error: allocationResponse.error,
-          creditAmount
+          error: ensureResponse.error,
+          creditAmount,
+          newTotalCredits: newAvailableCredits
         });
         
-        // This is a critical error for topups since they paid specifically for credits
-        throw new Error(PaymentError.TOPUP_OPENROUTER_UPDATE_FAILED);
-      }
-
-      logger.info('✅ OpenRouter credits allocated successfully for topup:', {
-        userId,
-        creditAmount,
-        newTotal: allocationResponse.data?.newTotal
-      });
-
-      // Sync credits to ensure consistency
-      const syncResponse = await openRouterManager.compareAndSyncCredits(userId, supabase, logger);
-      if (syncResponse.success) {
-        logger.info('✅ OpenRouter credits synced after topup:', {
-          userId,
-          syncData: syncResponse.data
-        });
-      } else {
-        logger.warn('⚠️ Credit sync failed after topup but allocation succeeded:', {
-          userId,
-          error: syncResponse.error
-        });
-      }
-
-    } catch (openRouterError: any) {
-      logger.error('❌ OpenRouter integration failed during topup:', {
-        userId,
-        error: openRouterError.message,
-        creditAmount
-      });
-      
-      // For topups, this is more critical since user paid specifically for credits
-      // But we've already added credits locally, so log this for manual resolution
-      if (openRouterError.message === PaymentError.TOPUP_OPENROUTER_UPDATE_FAILED) {
+        // For topups, this is critical since user paid specifically for credits
         logger.error('🚨 CRITICAL: Topup succeeded locally but failed on OpenRouter - manual intervention required:', {
           userId,
           transactionId: transaction.id,
           creditAmount,
           localCredits: newAvailableCredits
         });
+        
         // Don't throw - user got their local credits, admin can fix OpenRouter later
       } else {
-        throw openRouterError;
+        logger.info('✅ OpenRouter credits updated successfully for topup:', {
+          userId,
+          creditAmount,
+          newTotalCredits: newAvailableCredits
+        });
+
+        // ✅ Sync credits to ensure consistency
+        const syncResponse = await openRouterManager.syncUserCredits(userId, supabase, logger);
+        if (syncResponse.success) {
+          logger.info('✅ OpenRouter credits synced after topup:', {
+            userId,
+            syncData: syncResponse.data
+          });
+        } else {
+          logger.warn('⚠️ Credit sync failed after topup but update succeeded:', {
+            userId,
+            error: syncResponse.error
+          });
+        }
       }
+
+    } catch (openRouterError: any) {
+      logger.error('❌ OpenRouter integration failed during topup:', {
+        userId,
+        error: openRouterError.message,
+        creditAmount,
+        newTotalCredits: newAvailableCredits
+      });
+      
+      // For topups, this is more critical since user paid specifically for credits
+      // But we've already added credits locally, so log this for manual resolution
+      logger.error('🚨 CRITICAL: Topup succeeded locally but OpenRouter integration failed - manual intervention required:', {
+        userId,
+        transactionId: transaction.id,
+        creditAmount,
+        localCredits: newAvailableCredits,
+        error: openRouterError.message
+      });
+      
+      // Don't throw - user got their local credits, admin can fix OpenRouter later
     }
+
+    logger.info('🎉 Credit topup processing completed successfully:', {
+      userId,
+      creditsAdded: creditAmount,
+      newTotalCredits: newAvailableCredits
+    });
 
     return true;
 
