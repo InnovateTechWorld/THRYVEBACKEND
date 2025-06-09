@@ -85,8 +85,34 @@ app.register(fastifyCors, {
   optionsSuccessStatus: 204
 });
 
+
+app.get('/', async (request, reply) => {
+  return {
+    status: 'healthy',
+    service: 'Thryve Backend API',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  };
+});
+
+// Health check endpoint
+app.get('/health', async (request, reply) => {
+  return {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    version: process.version,
+    environment: process.env.NODE_ENV || 'development'
+  };
+});
+
 app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
   const noAuthRoutes = [
+        '/', // ✅ Add root route
+    '/health', // ✅ Add health check
+
     '/oauth/token',
     '/api/payment/webhook', // Flutterwave webhook doesn't need auth
   ];
@@ -145,6 +171,8 @@ app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) =
   }
 });
 
+
+
 // Initialize OpenRouter manager
 const openRouterManager = new OpenRouterManager(openRouterProvisioningKey);
 
@@ -185,12 +213,20 @@ if (flwPublicKey && flwSecretKey && flwWebhookSecret) { // Check all Flutterwave
 app.register(exportedApiRoutes, { supabase, genAI, openRouterProvisioningKey });
 
 
+// Replace your current app.listen() with:
+
 const start = async () => {
   try {
-    await app.listen({ port: 3000, host: '0.0.0.0' });
-    app.log.info(`Server listening on ${appBaseUrl} (internally on port 3000, host 0.0.0.0)`);
+    const port = Number(process.env.PORT) || 3000;
+    
+    await app.listen({ 
+      port, 
+      host: '0.0.0.0'
+    });
+    
+    console.log(`Server running on 0.0.0.0:${port}`);
   } catch (err) {
-    app.log.error(err);
+    console.error(err);
     process.exit(1);
   }
 };
