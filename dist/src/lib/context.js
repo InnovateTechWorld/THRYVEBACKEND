@@ -15,13 +15,15 @@ async function getUserContext(userId, supabase, logger) {
             .select('prompt')
             .eq('user_id', userId)
             .single();
+        // ✅ Fix: Query from 'memory' table (not 'user_memories')
         const { data: memories } = await supabase
-            .from('user_memories')
+            .from('memory') // ✅ Changed from 'user_memories'
             .select('content, created_at')
             .eq('user_id', userId)
             .order('created_at', { ascending: false });
+        // ✅ Fix: Query from 'notes' table (not 'user_notes')  
         const { data: notes } = await supabase
-            .from('user_notes')
+            .from('notes') // ✅ Changed from 'user_notes'
             .select('content, created_at')
             .eq('user_id', userId)
             .order('created_at', { ascending: false });
@@ -93,9 +95,11 @@ function buildEnhancedContextSystemPrompt(baseSystemPrompt, userContext, exportD
     return enhancedPrompt;
 }
 // Original functions for existing chat functionality (unchanged)
-function buildContextAwareMessages(userContext, sessionHistory, userMessage) {
+function buildContextAwareMessages(userContext, // ✅ Use UserContextData instead of UserContext
+sessionHistory, userMessage) {
     const messages = [];
     messages.push({ role: 'system', content: userContext.systemPrompt });
+    // ✅ Use FILTERED memories and notes
     if ((userContext.relevantMemories && userContext.relevantMemories.length > 0) ||
         (userContext.relevantNotes && userContext.relevantNotes.length > 0)) {
         let contextMessage = 'Additional context about the user:\n';

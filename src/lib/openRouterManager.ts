@@ -47,6 +47,18 @@ export interface KeyUsageInfo {
   lastSynced?: string;
 }
 
+export interface OpenRouterAuthKeyResponse {
+  data: {
+    label: string;
+    usage: number;
+    is_free_tier: boolean;
+    is_provisioning_key: boolean;
+    limit: number;
+    limit_remaining: number;
+    disabled?: boolean;
+  }
+}
+
 // Define the expected structure from the check_user_credits RPC
 interface CheckUserCreditsResult {
   has_credits: boolean;
@@ -452,86 +464,142 @@ const data = await response.json() as { data: { id: string }[] };
   /**
    * Check and sync user's credit usage
    */
-  async syncUserCredits(
-    userId: string,
-    supabase: SupabaseClient,
-    logger: FastifyBaseLogger
-  ): Promise<OpenRouterResponse<KeyUsageInfo>> {
-    try {
-      // Get user's key
-      const keyResponse = await this.getUserApiKey(userId, supabase, logger);
-      if (!keyResponse.success) {
-        return {
-           success: false,
-           error: keyResponse.error // Propagate error from getUserApiKey
-        };
-      }
+  // In src/lib/openRouterManager.ts
+// Replace the syncUserCredits method around line 483:
 
-      // Get usage from OpenRouter
-      const response = await fetch(`${this.baseUrl}/auth/key`, {
-        headers: {
-          'Authorization': `Bearer ${keyResponse.data}`,
-          'Content-Type': 'application/json'
-        }
-      });
+/**
+ * Check and sync user's credit usage using direct SQL
+ */
+// In src/lib/openRouterManager.ts - Replace the syncUserCredits method:
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        logger.error({ msg: 'Failed to get usage from OpenRouter', status: response.status, error: errorText });
-        return {
-          success: false,
-          error: {
-            code: OpenRouterError.USAGE_SYNC_FAILED,
-            message: 'Failed to get usage from OpenRouter',
-            details: errorText
-          }
-        };
-      }
-
-      const usageData = await response.json() as KeyUsageInfo; // Cast to KeyUsageInfo
-      
-      // Update database
-      await supabase.rpc('sync_openrouter_credits', {
-        p_user_id: userId,
-        p_credits_used: usageData.usage || 0,
-        p_total_balance: usageData.limit || 0
-      });
-
-      logger.info({ msg: 'User usage synced successfully', userId, usage: usageData.usage, remaining: usageData.limit ? usageData.limit - usageData.usage : null });
-
+/**
+ * Check and sync user's credit usage using direct SQL
+ */
+async syncUserCredits(
+  userId: string,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger
+): Promise<OpenRouterResponse<KeyUsageInfo>> {
+  try {
+    // Get user's key
+    const keyResponse = await this.getUserApiKey(userId, supabase, logger);
+    if (!keyResponse.success) {
       return {
-        success: true,
-        data: {
-          usage: usageData.usage || 0,
-          limit: usageData.limit,
-          remaining: usageData.limit ? usageData.limit - usageData.usage : null,
-          disabled: usageData.disabled || false,
-          lastSynced: new Date().toISOString()
+         success: false,
+         error: keyResponse.error
+      };
+    }
+
+    // Get usage from OpenRouter
+    const response = await fetch(`${this.baseUrl}/auth/key`, {
+      headers: {
+        'Authorization': `Bearer ${keyResponse.data}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error({ msg: 'Failed to get usage from OpenRouter', status: response.status, error: errorText });
+      return {
+        success: false,
+        error: {
+          code: OpenRouterError.USAGE_SYNC_FAILED,
+          message: 'Failed to get usage from OpenRouter',
+          details: errorText
         }
       };
+    }
 
-    } catch (error: any) {
-      logger.error({ msg: 'Error syncing user credits', error: error.message });
+const openRouterData = await response.json() as OpenRouterAuthKeyResponse;
+    const usageData = openRouterData.data; // ✅ Extract from data field
+    
+    // ✅ Get current local credits to preserve purchased amounts
+    const { data: currentCredits } = await supabase
+      .from('user_credit_balances')
+      .select('available_credits, total_purchased')
+      .eq('user_id', userId)
+      .single();
+
+    // ✅ Update database - preserve local credits but sync OpenRouter usage
+    const { error: updateError } = await supabase
+      .from('user_credit_balances')
+      .upsert({
+        user_id: userId,
+        // ✅ PRESERVE your purchased credits
+        available_credits: currentCredits?.available_credits || 0,
+        total_purchased: currentCredits?.total_purchased || 0,
+        // ✅ SYNC total_used with OpenRouter's usage
+        total_used: usageData.usage || 0, // ✅ This updates from OpenRouter
+        // ✅ Track OpenRouter data separately
+        openrouter_usage: usageData.usage || 0,
+        openrouter_limit: usageData.limit || 0,
+        openrouter_remaining: usageData.limit_remaining || 0,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      });
+
+    if (updateError) {
+      logger.error({ msg: 'Failed to update user credits in database', error: updateError });
       return {
         success: false,
         error: {
           code: OpenRouterError.INTERNAL_ERROR,
-          message: 'Failed to sync credits',
-          details: error.message
+          message: 'Failed to update credits in database',
+          details: updateError.message
         }
       };
     }
+
+    logger.info({ 
+      msg: 'User usage synced successfully from OpenRouter', 
+      userId, 
+      openrouterUsage: usageData.usage,
+      openrouterRemaining: usageData.limit_remaining,
+      localCreditsPreserved: currentCredits?.available_credits,
+      totalUsedSynced: usageData.usage
+    });
+
+    return {
+      success: true,
+      data: {
+        usage: usageData.usage || 0,
+        limit: usageData.limit,
+        remaining: usageData.limit_remaining || null,
+        disabled: usageData.disabled || false,
+        lastSynced: new Date().toISOString()
+      }
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error syncing user credits', error: error.message });
+    return {
+      success: false,
+      error: {
+        code: OpenRouterError.INTERNAL_ERROR,
+        message: 'Failed to sync credits',
+        details: error.message
+      }
+    };
   }
+}
 
   /**
    * Check if user has sufficient credits
    */
-  async checkUserCredits(
+  // In src/lib/openRouterManager.ts
+// Replace the checkUserCredits method around line 552:
+
+/**
+ * Check if user has sufficient credits using direct SQL query
+ */
+async checkUserCredits(
   userId: string,
   requiredCredits: number,
   supabase: SupabaseClient,
   logger: FastifyBaseLogger,
-  modelId?: string // Add optional model parameter
+  modelId?: string
 ): Promise<OpenRouterResponse<{ sufficient: boolean; available: number; isFreeModel?: boolean }>> {
   try {
     // If model doesn't require credits, allow access immediately
@@ -547,7 +615,7 @@ const data = await response.json() as { data: { id: string }[] };
       };
     }
 
-    // For paid models, perform credit check
+    // For paid models, perform credit check using direct SQL
     // Sync first to get latest usage
     const syncResult = await this.syncUserCredits(userId, supabase, logger);
     if (!syncResult.success) {
@@ -557,39 +625,42 @@ const data = await response.json() as { data: { id: string }[] };
       };
     }
 
-    const { data: checkResult, error: rpcError } = await supabase.rpc('check_user_credits', {
-      p_user_id: userId,
-      p_required_credits: requiredCredits
-    }).single<CheckUserCreditsResult>();
+    // ✅ Use direct SQL query instead of RPC
+    const { data: creditData, error: queryError } = await supabase
+      .from('user_credit_balances')
+      .select('available_credits')
+      .eq('user_id', userId)
+      .single();
 
-    if (rpcError) {
-      logger.error({ msg: 'Error calling check_user_credits RPC', error: rpcError });
+    if (queryError) {
+      logger.error({ msg: 'Error querying user credits directly', error: queryError });
       return {
         success: false,
         error: {
           code: OpenRouterError.INTERNAL_ERROR,
-          message: 'Failed to check credits via RPC',
-          details: rpcError.message
+          message: 'Failed to check credits',
+          details: queryError.message
         }
       };
     }
 
-    if (!checkResult || !checkResult.has_credits) {
+    const availableCredits = creditData?.available_credits || 0;
+    const hasSufficientCredits = availableCredits >= requiredCredits;
+
+    if (!hasSufficientCredits) {
       // Enhanced error message with free model suggestions
       const userApiKeyResponse = await this.getUserApiKey(userId, supabase, logger);
       const userApiKey = userApiKeyResponse.success ? userApiKeyResponse.data : undefined;
       const freeModels = await this.getAvailableFreeModels(userApiKey, logger);
       
-      const errorMessage = checkResult?.error_message || 'Insufficient credits';
-      
       return {
         success: false,
         error: {
           code: OpenRouterError.INSUFFICIENT_CREDITS,
-          message: `${errorMessage}. Try using a free model instead.`,
+          message: `Insufficient credits. Required: ${requiredCredits}, Available: ${availableCredits}. Try using a free model instead.`,
           details: {
             required: requiredCredits,
-            available: checkResult?.available_credits || 0,
+            available: availableCredits,
             freeModelsAvailable: freeModels,
             suggestion: `Consider using a free model like: ${freeModels.slice(0, 3).join(', ')}`,
             freeModelPattern: 'Models ending with ":free" don\'t require credits'
@@ -602,7 +673,7 @@ const data = await response.json() as { data: { id: string }[] };
       success: true,
       data: {
         sufficient: true,
-        available: checkResult.available_credits,
+        available: availableCredits,
         isFreeModel: false
       }
     };
@@ -648,8 +719,7 @@ async checkModelAccess(
         subscription_plans (
           id,
           name,
-          free_models_only,
-          allowed_models
+          free_models_only
         )
       `)
       .eq('user_id', userId)
@@ -726,20 +796,13 @@ async checkModelAccess(
       };
     }
 
-    // Check if model is in allowed_models list
-    if (plan.allowed_models && !plan.allowed_models.includes(modelId)) {
-      return {
-        success: false,
-        error: {
-          code: OpenRouterError.MODEL_NOT_ALLOWED,
-          message: 'Model not available in current plan',
-          details: {
-            currentPlan: plan.name,
-            allowedModels: plan.allowed_models
-          }
-        }
-      };
-    }
+    // ✅ For paid plans (Pro/Power), allow all paid models
+    logger.info({ 
+      msg: 'Paid model access granted for subscription user', 
+      userId, 
+      modelId, 
+      planName: plan.name 
+    });
 
     return {
       success: true,

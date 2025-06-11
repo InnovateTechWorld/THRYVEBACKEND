@@ -45,6 +45,16 @@ async function chatRoutes(fastify, options) {
                 userContext.relevantMemories = [];
                 userContext.relevantNotes = [];
             }
+            fastify.log.info({
+                msg: 'Memory filtering debug',
+                userMessage: contentForFiltering,
+                totalMemories: userContext.memories.length,
+                totalNotes: userContext.notes.length,
+                filteredMemories: userContext.relevantMemories?.length || 0,
+                filteredNotes: userContext.relevantNotes?.length || 0,
+                memoriesBeingUsed: userContext.relevantMemories,
+                notesBeingUsed: userContext.relevantNotes
+            });
             const { data: existingHistory, error: historyCheckError } = await supabase
                 .from('chat_history')
                 .select('id')
@@ -94,6 +104,12 @@ async function chatRoutes(fastify, options) {
                 };
             }
             const messagesForOpenRouter = (0, context_1.buildContextAwareMessages)(userContext, sessionHistory, userMessage);
+            fastify.log.info({
+                msg: 'Messages being sent to OpenRouter',
+                messageCount: messagesForOpenRouter.length,
+                systemMessage: messagesForOpenRouter.find(m => m.role === 'system')?.content?.substring(0, 500) + '...',
+                hasMemoryContext: messagesForOpenRouter.some(m => m.content?.includes('memory') || m.content?.includes('remember'))
+            });
             const { error: storeError } = await supabase.from('chat_history').insert([{
                     user_id: userId,
                     session_id: actualSessionId,
@@ -310,17 +326,25 @@ async function chatRoutes(fastify, options) {
                     if (textPart)
                         textContentForAnalysis = textPart.text;
                 }
+                // ✅ Fix: Do memory analysis FIRST, then check for duplicates
                 if (textContentForAnalysis.trim() && assistantResponseContent.trim()) {
                     const memoryAnalysis = await (0, ai_1.shouldCommitToMemory)(textContentForAnalysis, assistantResponseContent, JSON.stringify({ memories: userContext.memories, notes: userContext.notes }), genAI, fastify.log);
+                    // ✅ Fix: Now check for duplicates AFTER we have the analysis
                     if (memoryAnalysis.shouldCommit && memoryAnalysis.memoryContent) {
-                        const { error: memoryError } = await supabase.from('memory').insert([{
-                                user_id: userId,
-                                content: memoryAnalysis.memoryContent
-                            }]);
-                        if (memoryError)
-                            fastify.log.error({ msg: 'Failed to auto-commit to memory', err: memoryError });
-                        else
-                            fastify.log.info({ msg: 'Auto-committed to memory', content: memoryAnalysis.memoryContent });
+                        const isDuplicate = (0, ai_1.isDuplicateMemory)(memoryAnalysis.memoryContent, userContext.memories);
+                        if (!isDuplicate) {
+                            const { error: memoryError } = await supabase.from('memory').insert([{
+                                    user_id: userId,
+                                    content: memoryAnalysis.memoryContent
+                                }]);
+                            if (memoryError)
+                                fastify.log.error({ msg: 'Failed to auto-commit to memory', err: memoryError });
+                            else
+                                fastify.log.info({ msg: 'Auto-committed to memory', content: memoryAnalysis.memoryContent });
+                        }
+                        else {
+                            fastify.log.info({ msg: 'Skipped duplicate memory', content: memoryAnalysis.memoryContent });
+                        }
                     }
                 }
             }

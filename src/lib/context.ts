@@ -28,7 +28,7 @@ export interface ExportedApiData {
   allowed_models: string[];
 }
 
-export async function getUserContext(userId: string, supabase: SupabaseClient, logger: FastifyBaseLogger): Promise<UserContext> {
+export async function getUserContext(userId: string, supabase: SupabaseClient, logger: FastifyBaseLogger): Promise<UserContextData> {
   try {
     const { data: profile } = await supabase
       .from('system_prompts')
@@ -36,14 +36,16 @@ export async function getUserContext(userId: string, supabase: SupabaseClient, l
       .eq('user_id', userId)
       .single();
 
+    // ✅ Fix: Query from 'memory' table (not 'user_memories')
     const { data: memories } = await supabase
-      .from('user_memories')
+      .from('memory')  // ✅ Changed from 'user_memories'
       .select('content, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
+    // ✅ Fix: Query from 'notes' table (not 'user_notes')  
     const { data: notes } = await supabase
-      .from('user_notes')
+      .from('notes')  // ✅ Changed from 'user_notes'
       .select('content, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
@@ -140,7 +142,7 @@ export function buildEnhancedContextSystemPrompt(
 
 // Original functions for existing chat functionality (unchanged)
 export function buildContextAwareMessages(
-  userContext: UserContext,
+  userContext: UserContextData,  // ✅ Use UserContextData instead of UserContext
   sessionHistory: Array<{ role: string; content: string }>,
   userMessage: { role: string; content: string }
 ): Array<{ role: string; content: string }> {
@@ -148,6 +150,7 @@ export function buildContextAwareMessages(
 
   messages.push({ role: 'system', content: userContext.systemPrompt });
 
+  // ✅ Use FILTERED memories and notes
   if ((userContext.relevantMemories && userContext.relevantMemories.length > 0) || 
       (userContext.relevantNotes && userContext.relevantNotes.length > 0)) {
     let contextMessage = 'Additional context about the user:\n';

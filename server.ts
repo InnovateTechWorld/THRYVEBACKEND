@@ -20,6 +20,8 @@ import developerRoutes from './src/routes/developer';
 import adminApiManagementRoutes from './src/routes/admin';
 import analyticsRoutes from './src/routes/analytics';
 import paymentRoutes from './src/routes/payment';
+import defaultModelRoutes from './src/routes/defaultModel';
+
 
 
 declare module '@fastify/jwt' {
@@ -193,6 +195,8 @@ app.register(async (fastify) => {
   });
 });
 
+
+app.register(defaultModelRoutes, { supabase });
 app.register(userContextRoutes, { prefix: '/', supabase });
 app.register(chatRoutes, { prefix: '/', supabase, genAI, openRouterProvisioningKey });
 app.register(modelRoutes, { prefix: '/', openRouterProvisioningKey, supabase });

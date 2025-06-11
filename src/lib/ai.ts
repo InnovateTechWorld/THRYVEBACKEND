@@ -140,6 +140,31 @@ Be selective - only include what's truly useful for this specific conversation.`
   }
 }
 
+
+export function isDuplicateMemory(newContent: string, existingMemories: any[]): boolean {
+  const normalizedNew = newContent.toLowerCase().trim();
+  
+  return existingMemories.some(memory => {
+    const normalizedExisting = memory.content.toLowerCase().trim();
+    
+    // Check for exact matches
+    if (normalizedNew === normalizedExisting) return true;
+    
+    // Check for semantic similarity (simple approach)
+    const newWords = normalizedNew.split(' ');
+    const existingWords = normalizedExisting.split(' ');
+    
+    // If 80% of words overlap and both are short, consider duplicate
+    if (newWords.length <= 6 && existingWords.length <= 6) {
+      const overlap = newWords.filter(word => existingWords.includes(word)).length;
+      const similarity = overlap / Math.max(newWords.length, existingWords.length);
+      return similarity > 0.8;
+    }
+    
+    return false;
+  });
+}
+
 // Function to analyze if content should be committed to memory using Gemini
 export async function shouldCommitToMemory(
   userMessage: string,
@@ -159,8 +184,11 @@ export async function shouldCommitToMemory(
         }
     });
 
+        const contextData: { memories: any[]; notes: any[] } = JSON.parse(userContext);
+
+
     const prompt = `You are an AI assistant that determines whether user conversation content should be saved to their personal memory for future reference.
-Analyze both the user's message AND the assistant's response to determine if they contain:
+Analyze both the user's message  to determine if they contain:
 - Important personal information (preferences, facts about the user, goals, etc.)
 - Key insights, decisions, or conclusions reached
 - Information the user might want to reference later
@@ -169,9 +197,32 @@ Analyze both the user's message AND the assistant's response to determine if the
 If you find personal information about the user, create a SHORT memory (1-3 sentences max).
 If the content is not relevant or is generic, do NOT save it.
 IGNORE everything the assistant said. ONLY focus on what the USER revealed about themselves.
+
+CRITICAL RULES:
+1. ONLY save NEW personal facts about the user (name, projects, preferences, skills, etc.)
+2. DO NOT save temporary questions, requests for advice, or conversation topics
+3. DO NOT save duplicate information that already exists
+4. If you know the user's name, use it instead of "User" in memories
+5. Focus on WHO the user is, WHAT they do,NOT what they're asking about!
+6. Only Save significant and relevant update if any to a last memory.
+7. ONLY analyze what the USER actually wrote in their message
+8. DO NOT create recommendations or answers
+9. DO NOT save questions or requests for advice
+10. ONLY save concrete personal facts the user revealed about themselves
+11. If the user didn't reveal any NEW personal information, return shouldCommit: false
+
+
+
 Current user context: ${userContext}
 User message: "${userMessage}"
-Assistant response: "${assistantResponse}"
+IMPORTANT: Check if the information already exists in the user's current memories before deciding to commit new information.
+
+Current user memories:
+${contextData.memories.map((m: any, i: number) => `${i + 1}. ${m.content}`).join('\n')}
+
+Current user notes:
+${contextData.notes.map((n: any, i: number) => `${i + 1}. ${n.content}`).join('\n')}
+
 Return your response as a JSON object with this exact structure:
 {
   "shouldCommit": true/false,
@@ -198,6 +249,14 @@ Examples of what NOT to save:
 - Universal best practices
 - Assistant explanations or advice
 - Tutorial content or step-by-step guides
+❌ "User is seeking advice about competitors"
+❌ "User asked about marketing strategies"
+❌ "User wants help with business plan"
+❌ "User is looking for funding options"
+❌ Generic questions or requests for help
+❌ Temporary conversation topics
+-  "The user is seeking information"
+
 Be very conservative - only save clear personal facts about the user.
 Only commit meaningful, referenceable information that would help in future conversations.`;
 
@@ -303,3 +362,5 @@ export function getModelCapabilities(modelId: string) {
 
   return capabilities;
 }
+
+// Add this function before shouldCommitToMemory

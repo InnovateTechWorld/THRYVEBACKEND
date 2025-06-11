@@ -17,7 +17,11 @@ const SKIP_CREDIT_CHECK_ROUTES = [
     '/api/exported/context/v1/models',
     '/api/exported/session/v1/models',
     '/models',
-    '/models/free'
+    '/models/free',
+    '/export/session/current', // ✅ Add this line to skip middleware
+    '/export/context/current', // ✅ Add this too if exists
+    '/export/context', // ✅ Add this too
+    '/export/usage' // ✅ And this
 ];
 function createCreditCheckMiddleware(options) {
     const { supabase, openRouterProvisioningKey, requiredCredits = 0.001 } = options;

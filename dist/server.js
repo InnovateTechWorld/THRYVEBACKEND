@@ -24,6 +24,7 @@ const developer_1 = __importDefault(require("./src/routes/developer"));
 const admin_1 = __importDefault(require("./src/routes/admin"));
 const analytics_1 = __importDefault(require("./src/routes/analytics"));
 const payment_1 = __importDefault(require("./src/routes/payment"));
+const defaultModel_1 = __importDefault(require("./src/routes/defaultModel"));
 const app = (0, fastify_1.default)({ logger: true });
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -146,6 +147,7 @@ app.register(async (fastify) => {
         return handler(request, reply);
     });
 });
+app.register(defaultModel_1.default, { supabase });
 app.register(userContext_1.default, { prefix: '/', supabase });
 app.register(chat_1.default, { prefix: '/', supabase, genAI, openRouterProvisioningKey });
 app.register(models_1.default, { prefix: '/', openRouterProvisioningKey, supabase });
