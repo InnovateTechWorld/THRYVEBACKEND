@@ -197,22 +197,33 @@ async function paymentRoutes(fastify, options) {
             const userEmail = request.user.email;
             const body = request.body;
             let { type, planId, amount, currency, country, redirectUrl } = body;
-            // Basic validation
-            if (!type || !currency || !redirectUrl) {
-                return reply.code(400).send({ error: 'Missing required fields: type, currency, redirectUrl' });
+            if (!userEmail) {
+                return reply.code(400).send({
+                    error: 'User email is required for payment processing',
+                    message: 'Please ensure your account has a valid email address'
+                });
             }
-            // Check if currency is supported
+            console.log('💳 PAYMENT INITIATION START:', {
+                userId,
+                userEmail,
+                type,
+                amount,
+                currency, // ✅ User's selected currency
+                planId,
+                redirectUrl,
+                country,
+                isProduction: !process.env.FLW_PUBLIC_KEY?.includes('TEST')
+            });
+            // ✅ Validate currency
             if (!currencyConverter_1.CurrencyConverter.isSupported(currency)) {
                 return reply.code(400).send({
                     error: 'Currency not supported',
                     supportedCurrencies: currencyConverter_1.CurrencyConverter.getSupportedCurrencies().map(c => c.code)
                 });
             }
-            if (type === 'subscription' && !planId) {
-                return reply.code(400).send({ error: 'Plan ID required for subscription' });
-            }
-            // For subscription, get amount from plan if not provided
-            if (type === 'subscription' && !amount) {
+            // ✅ For subscriptions, get plan price and keep it in user's currency
+            let finalAmount = amount;
+            if (type === 'subscription' && !amount && planId) {
                 const { data: plan, error: planError } = await supabase
                     .from('subscription_plans')
                     .select('price')
@@ -221,53 +232,108 @@ async function paymentRoutes(fastify, options) {
                 if (planError || !plan) {
                     return reply.code(404).send({ error: 'Subscription plan not found' });
                 }
-                amount = plan.price;
+                // ✅ Convert plan price from USD to user's currency
+                finalAmount = currency.toUpperCase() === 'USD'
+                    ? plan.price
+                    : currencyConverter_1.CurrencyConverter.fromUSD(plan.price, currency);
+                console.log('💰 Plan price conversion:', {
+                    planPriceUSD: plan.price,
+                    userCurrency: currency,
+                    convertedAmount: finalAmount,
+                    exchangeRate: currencyConverter_1.CurrencyConverter.getExchangeRate('USD', currency)
+                });
             }
-            // For topup, amount is required
-            if (type === 'topup' && (!amount || amount <= 0)) {
-                return reply.code(400).send({ error: 'Valid amount required for topup' });
+            else if (type === 'topup' && amount) {
+                // ✅ For top-ups, amount is USD credits they want (like subscription plan price)
+                const creditAmountUSD = amount; // USD credits they want ($10)
+                // Convert to local currency for payment (same as subscription logic)
+                finalAmount = currency.toUpperCase() === 'USD'
+                    ? creditAmountUSD
+                    : currencyConverter_1.CurrencyConverter.fromUSD(creditAmountUSD, currency);
+                console.log('💰 Top-up amount handling (like subscription):', {
+                    creditAmountUSD: creditAmountUSD, // $10 credits
+                    paymentAmountLocal: finalAmount, // ₦14,950 payment
+                    userCurrency: currency, // NGN
+                    exchangeRate: currencyConverter_1.CurrencyConverter.getExchangeRate('USD', currency)
+                });
             }
-            if (!amount || amount <= 0) {
-                return reply.code(400).send({ error: 'Amount must be greater than 0' });
+            if (!finalAmount || finalAmount <= 0) {
+                return reply.code(400).send({ error: 'Invalid payment amount' });
             }
-            // Check for user email
-            if (!userEmail) {
-                return reply.code(401).send({ error: 'User email not found' });
-            }
-            // Convert amount if not in USD (for OpenRouter credits)
-            const amountInUSD = currency.toUpperCase() === 'USD'
-                ? amount
-                : currencyConverter_1.CurrencyConverter.toUSD(amount, currency);
+            // ✅ Get country from currency if not provided
+            const paymentCountry = country || getCurrencyCountry(currency);
             const paymentData = {
                 userId,
                 email: userEmail,
-                amount,
-                currency: currency.toUpperCase(),
+                amount: finalAmount, // ✅ Amount in user's currency
+                currency: currency.toUpperCase(), // ✅ User's currency
                 type,
                 planId,
                 redirectUrl,
-                country: country?.toUpperCase()
+                country: paymentCountry?.toUpperCase()
             };
+            console.log('📋 PAYMENT DATA PREPARED:', {
+                paymentData: JSON.stringify(paymentData, null, 2)
+            });
             const result = await flutterwaveService.initializePayment(paymentData, supabase, fastify.log);
+            console.log('✅ PAYMENT INITIALIZED:', {
+                reference: result.reference,
+                hasPaymentUrl: !!result.paymentUrl,
+                currency: currency.toUpperCase(),
+                amount: finalAmount
+            });
             return reply.send({
                 success: true,
                 data: {
                     ...result,
-                    amountLocal: amount,
-                    currency: currency.toUpperCase(),
-                    amountUSD: amountInUSD,
+                    amountLocal: finalAmount, // ✅ Amount in user's currency
+                    currency: currency.toUpperCase(), // ✅ User's currency
+                    amountUSD: currencyConverter_1.CurrencyConverter.toUSD(finalAmount, currency),
                     exchangeRate: currencyConverter_1.CurrencyConverter.getExchangeRate(currency, 'USD')
                 }
             });
         }
         catch (error) {
-            fastify.log.error({ msg: 'Error initiating payment', error: error.message });
-            return reply.code(500).send({ error: 'Failed to initiate payment' });
+            console.log('🔥 PAYMENT INITIATION ERROR:', {
+                error: error.message,
+                stack: error.stack,
+                userId: request.user?.id
+            });
+            return reply.code(500).send({
+                error: 'Failed to initialize payment',
+                details: error.message
+            });
         }
     });
+    // ✅ Helper function to get country from currency
+    function getCurrencyCountry(currency) {
+        const currencyToCountry = {
+            'USD': 'US',
+            'EUR': 'DE',
+            'GBP': 'GB',
+            'NGN': 'NG',
+            'GHS': 'GH',
+            'CAD': 'CA',
+            'AUD': 'AU',
+            'JPY': 'JP',
+            'CNY': 'CN',
+            'INR': 'IN',
+            'SGD': 'SG',
+            'MYR': 'MY',
+            'THB': 'TH',
+            'PHP': 'PH',
+            'AED': 'AE',
+            'SAR': 'SA',
+            'EGP': 'EG',
+            'MAD': 'MA',
+            'KES': 'KE',
+            'ZAR': 'ZA'
+        };
+        return currencyToCountry[currency.toUpperCase()] || 'NG';
+    }
     /**
-     * ✅ FIXED: Verify payment with correct database field names
-     */
+       * ✅ FIXED: Verify payment with correct database field names
+       */
     // Replace your entire /api/payment/verify endpoint with this:
     // Update your verification section around line 396
     // Replace your entire verification endpoint starting around line 323
@@ -536,7 +602,14 @@ async function paymentRoutes(fastify, options) {
             const userId = request.user.id;
             const body = request.body;
             const { planId } = body;
+            console.log('🔄 SUBSCRIPTION REQUEST START:', {
+                userId,
+                planId,
+                userEmail: request.user.email,
+                requestBody: JSON.stringify(body, null, 2)
+            });
             if (!planId) {
+                fastify.log.error('❌ NO PLAN ID PROVIDED');
                 return reply.code(400).send({ error: 'Plan ID is required' });
             }
             // Get plan details
@@ -545,11 +618,23 @@ async function paymentRoutes(fastify, options) {
                 .select('*')
                 .eq('id', planId)
                 .single();
+            console.log('📋 PLAN QUERY RESULT:', {
+                planFound: !!plan,
+                planError: planError?.message,
+                planData: plan ? {
+                    id: plan.id,
+                    name: plan.name,
+                    price: plan.price,
+                    credits: plan.credits
+                } : null
+            });
             if (planError || !plan) {
+                console.log('❌ PLAN NOT FOUND:', { planId, planError });
                 return reply.code(404).send({ error: 'Subscription plan not found' });
             }
             // Check if it's a free plan
             if (plan.price === 0) {
+                console.log('🆓 FREE PLAN - ACTIVATING IMMEDIATELY');
                 // Free plan - activate immediately
                 const { error: subError } = await supabase
                     .from('user_subscriptions')
@@ -590,32 +675,58 @@ async function paymentRoutes(fastify, options) {
                         error: openRouterError.message
                     });
                 }
-                return reply.send({
+                const responseData = {
                     success: true,
                     message: 'Free plan activated successfully',
-                    data: { planId, status: 'active' }
+                    data: {
+                        planId,
+                        status: 'active',
+                        requiresPayment: false // ✅ Add this
+                    }
+                };
+                console.log('📤 SENDING FREE PLAN RESPONSE:', {
+                    responseData: JSON.stringify(responseData, null, 2)
                 });
+                return reply.send(responseData);
             }
-            // Paid plan - return payment initiation info
-            return reply.send({
-                success: true,
-                message: 'Payment required for this plan',
-                data: {
-                    planId,
-                    amount: plan.price,
-                    currency: 'USD',
-                    requiresPayment: true
-                }
-            });
+            else {
+                // ✅ PAID PLAN - LOG EVERYTHING
+                console.log('💰 PAID PLAN DETECTED:', {
+                    planId: plan.id,
+                    planName: plan.name,
+                    planPrice: plan.price,
+                    planCredits: plan.credits,
+                    userId
+                });
+                const responseData = {
+                    success: true,
+                    message: 'Payment required for this plan',
+                    data: {
+                        planId,
+                        planName: plan.name, // ✅ Add for better UX
+                        amount: plan.price,
+                        currency: 'USD',
+                        requiresPayment: true, // ✅ THIS IS CRUCIAL
+                        credits: plan.credits || 0
+                    }
+                };
+                console.log('📤 SENDING PAID PLAN RESPONSE:', {
+                    responseData: JSON.stringify(responseData, null, 2)
+                });
+                return reply.send(responseData);
+            }
         }
         catch (error) {
-            fastify.log.error({ msg: 'Error managing subscription', error: error.message });
+            console.log('🔥 SUBSCRIPTION ENDPOINT ERROR:', {
+                error: error.message,
+                stack: error.stack,
+                userId: request.user?.id
+            });
             return reply.code(500).send({ error: 'Internal server error' });
         }
-    });
-    /**
-     * Cancel subscription
-     */
+    }); /**
+       * Cancel subscription
+       */
     fastify.delete('/api/payment/subscription', async (request, reply) => {
         try {
             const userId = request.user.id;
@@ -672,6 +783,73 @@ async function paymentRoutes(fastify, options) {
         catch (error) {
             fastify.log.error({ msg: 'Error fetching transactions', error: error.message });
             return reply.code(500).send({ error: 'Internal server error' });
+        }
+    });
+    // Add this to your payment.ts file
+    fastify.get('/api/payment/dashboard-complete', async (request, reply) => {
+        try {
+            const userId = request.user.id;
+            const userEmail = request.user.email;
+            // ✅ OPTIMIZED: Single query with all joins
+            const [subscription, credits, plans, transactions] = await Promise.all([
+                supabase
+                    .from('user_subscriptions')
+                    .select(`
+          *,
+          subscription_plans (*)
+        `)
+                    .eq('user_id', userId)
+                    .eq('status', 'active')
+                    .single(),
+                supabase
+                    .from('user_credit_balances')
+                    .select('*')
+                    .eq('user_id', userId)
+                    .single(),
+                supabase
+                    .from('subscription_plans')
+                    .select('*')
+                    .order('price', { ascending: true }),
+                supabase
+                    .from('payment_transactions')
+                    .select('*')
+                    .eq('user_id', userId)
+                    .order('created_at', { ascending: false })
+                    .limit(5)
+            ]);
+            // Build billing dashboard response
+            const billingData = {
+                user_id: userId,
+                email: userEmail,
+                plan_name: subscription.data?.subscription_plans?.name || 'Free',
+                plan_price: subscription.data?.subscription_plans?.price || 0,
+                subscription_status: subscription.data?.status || 'inactive',
+                current_period_end: subscription.data?.current_period_end || null,
+                available_credits: credits.data?.available_credits || 0,
+                total_purchased: credits.data?.total_purchased || 0,
+                total_used: credits.data?.total_used || 0,
+                total_transactions: transactions.data?.length || 0,
+                total_spent: credits.data?.total_purchased || 0
+            };
+            return reply.send({
+                success: true,
+                data: {
+                    plans: plans.data || [],
+                    subscription: subscription.data || null,
+                    credits: credits.data || { available_credits: 0, total_purchased: 0, total_used: 0 },
+                    dashboard: {
+                        billing: billingData,
+                        recentTransactions: transactions.data || []
+                    }
+                }
+            });
+        }
+        catch (error) {
+            fastify.log.error('Complete dashboard error:', error);
+            return reply.code(500).send({
+                success: false,
+                error: 'Internal server error'
+            });
         }
     });
     /**

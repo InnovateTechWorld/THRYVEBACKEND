@@ -106,248 +106,262 @@ export class FlutterwaveService {
    * Initialize payment using Flutterwave Standard API
    * ✅ FIXED: Using correct database field names
    */
-  async initializePayment(
-    paymentData: PaymentInitData,
-    supabase: SupabaseClient,
-    logger: FastifyBaseLogger
-  ): Promise<{ paymentUrl: string; reference: string; transaction_id?: string }> {
-    try {
-      const reference = `${paymentData.type}_${paymentData.userId}_${Date.now()}`;
-      
-      // Convert to USD for OpenRouter credits
-      const amountInUSD = paymentData.currency === 'USD' 
-        ? paymentData.amount 
-        : CurrencyConverter.toUSD(paymentData.amount, paymentData.currency);
+async initializePayment(
+  paymentData: PaymentInitData,
+  supabase: SupabaseClient,
+  logger: FastifyBaseLogger
+): Promise<{ paymentUrl: string; reference: string; transaction_id?: string }> {
+  try {
+    const reference = `${paymentData.type}_${paymentData.userId}_${Date.now()}`;
+    
+    // ✅ FIXED: Keep amount in user's currency for Flutterwave
+    // Only convert to USD for internal credit calculations
+    const amountInUSD = paymentData.currency === 'USD' 
+      ? paymentData.amount 
+      : CurrencyConverter.toUSD(paymentData.amount, paymentData.currency);
 
-      // ✅ FIXED: Calculate correct credit amount based on type
-      let creditAmount: number;
-      let platformFeeUSD: number;
+    // ✅ Calculate credit amount based on type (in USD for consistency)
+    let creditAmount: number;
+    let platformFeeUSD: number;
 
-      if (paymentData.type === 'subscription' && paymentData.planId) {
-        // For subscriptions: Get the actual credits from the plan (already discounted)
-        const { data: planData, error: planError } = await supabase
-          .from('subscription_plans')
-          .select('credits')
-          .eq('id', paymentData.planId)
-          .single();
+    if (paymentData.type === 'subscription' && paymentData.planId) {
+      const { data: planData, error: planError } = await supabase
+        .from('subscription_plans')
+        .select('credits')
+        .eq('id', paymentData.planId)
+        .single();
 
-        if (planError || !planData) {
-          logger.error({ msg: 'Plan not found for subscription', planId: paymentData.planId, error: planError });
-          throw new Error('Subscription plan not found');
-        }
-
-        creditAmount = parseFloat(planData.credits) || 0; // $8 for Pro, $20 for Power, $0 for Free
-        platformFeeUSD = amountInUSD - creditAmount; // Platform keeps the difference
-
-        logger.info({ 
-          msg: 'Subscription transaction - using plan credits',
-          planId: paymentData.planId,
-          paymentAmount: amountInUSD,
-          creditsToReceive: creditAmount,
-          platformFee: platformFeeUSD
-        });
-
-      } else {
-        // For top-ups: User gets full amount in credits (minus platform fee)
-        platformFeeUSD = amountInUSD * 0.15; // 15% platform fee for top-ups
-        creditAmount = amountInUSD; // User gets full amount for top-ups
-
-        logger.info({ 
-          msg: 'Top-up transaction - full amount as credits',
-          paymentAmount: amountInUSD,
-          creditsToReceive: creditAmount,
-          platformFee: platformFeeUSD
-        });
+      if (planError || !planData) {
+        logger.error({ msg: 'Plan not found for subscription', planId: paymentData.planId, error: planError });
+        throw new Error('Subscription plan not found');
       }
-      
-      // Get exchange rate for tracking
-      const exchangeRate = paymentData.currency === 'USD' 
-        ? 1.0 
-        : CurrencyConverter.getExchangeRate(paymentData.currency, 'USD');
 
-      // Get supported payment methods for this currency
-      const supportedMethods = CurrencyConverter.getSupportedPaymentMethods(paymentData.currency);
-      const paymentOptions = supportedMethods.join(',');
-
-      // Standard API payload - exactly as per Flutterwave documentation
-      const payload = {
-        tx_ref: reference,
-        amount: paymentData.amount.toString(), // Must be string as per docs
-        currency: paymentData.currency.toUpperCase(),
-        redirect_url: paymentData.redirectUrl,
-        customer: {
-          email: paymentData.email,
-          name: paymentData.fullName || paymentData.email.split('@')[0],
-          ...(paymentData.phoneNumber && { phonenumber: paymentData.phoneNumber })
-        },
-        // Basic customizations only to avoid blocking
-        customizations: {
-          title: paymentData.type === 'subscription' ? 'AI Platform Subscription' : 'AI Platform Credits',
-          description: paymentData.type === 'subscription' 
-            ? 'Subscribe to unlock premium AI features' 
-            : 'Top up your AI credits',
-          logo: '' // You can add your logo URL here
-        },
-        // ✅ FIXED: Store the plan_id in metadata for subscriptions
-        meta: {
-          user_id: paymentData.userId,
-          type: paymentData.type,
-          plan_id: paymentData.planId || '', // ✅ THIS IS IMPORTANT - plan_id for subscription processing
-          platform_fee_usd: platformFeeUSD,
-          credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive
-          exchange_rate: exchangeRate,
-          country: paymentData.country || 'NG'
-        },
-        // Dynamic payment options based on currency support
-        payment_options: paymentOptions,
-        // Session configurations
-        configurations: {
-          session_duration: 1440, // 24 hours max
-          max_retry_attempt: 3
-        }
-      };
+      creditAmount = parseFloat(planData.credits) || 0;
+      platformFeeUSD = amountInUSD - creditAmount;
 
       logger.info({ 
-        msg: 'Initializing Flutterwave Standard payment', 
-        reference, 
+        msg: 'Subscription transaction - using plan credits',
+        planId: paymentData.planId,
+        paymentAmountUSD: amountInUSD,
+        paymentAmountLocal: paymentData.amount,
         currency: paymentData.currency,
-        amountLocal: paymentData.amount,
-        amountUSD: amountInUSD,
-        exchangeRate,
-        supportedMethods,
         creditsToReceive: creditAmount,
         platformFee: platformFeeUSD
       });
 
-      // ✅ FIXED: Store transaction record with correct credit amounts
-      const { data: transaction, error: dbError } = await supabase
-        .from('payment_transactions')
-        .insert({
-          user_id: paymentData.userId,
-          flutterwave_reference: reference,
-          flutterwave_transaction_id: null,
-          type: paymentData.type,
-          plan_id: paymentData.planId || null, // ✅ FIXED: Store plan_id for subscriptions
-          
-          // Required basic fields
-          amount: paymentData.amount,
-          currency: paymentData.currency,
-          credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive (not full payment)
-          
-          // Detailed tracking fields
-          amount_usd: amountInUSD,
-          amount_local: paymentData.amount,
-          local_currency: paymentData.currency,
-          exchange_rate: exchangeRate,
-          openrouter_credit_amount: creditAmount, // ✅ FIXED: Actual credits user will receive
-          platform_fee: platformFeeUSD,
-          status: 'pending',
-          country: paymentData.country || 'NG',
-          metadata: {
-            customer_info: {
-              email: paymentData.email,
-              name: paymentData.fullName || paymentData.email.split('@')[0],
-              phone: paymentData.phoneNumber
-            },
-            payload_sent: payload
-          }
-        })
-        .select()
-        .single();
+    } else {
 
-      // Continue with rest of the method...
-      if (dbError) {
-        logger.error('Failed to store payment transaction:', { 
-          error: dbError,
-          reference,
-          userId: paymentData.userId,
-          amount: paymentData.amount,
-          currency: paymentData.currency,
-          type: paymentData.type
-        });
-        throw new Error(`Failed to record payment transaction: ${dbError.message}`);
+  // ✅ FIXED: For top-ups, user specifies USD amount but pays in local currency (same as subscriptions)
+  
+  // The amount they want in USD credits (like plan price)
+  const creditAmountUSD = paymentData.amount; // This should be the USD amount they want
+  
+  // Convert to local currency for payment (same logic as subscriptions)
+  creditAmount = paymentData.currency === 'USD' 
+    ? paymentData.amount 
+    : CurrencyConverter.toUSD(paymentData.amount, paymentData.currency);
+  
+  platformFeeUSD = creditAmount * 0.15; // 15% platform fee based on USD credits
+
+  logger.info({ 
+    msg: 'Top-up transaction - local payment for USD credits',
+    paymentAmountLocal: paymentData.amount,        // ✅ What user pays (₦7,462)
+    paymentCurrency: paymentData.currency,         // ✅ Local currency (NGN)
+    creditsInUSD: creditAmount,                    // ✅ USD credits they get ($5)
+    creditsToReceive: creditAmount,                // ✅ Credits in USD ($5)
+    platformFeeUSD: platformFeeUSD,                // ✅ Platform fee in USD
+    exchangeRate: CurrencyConverter.getExchangeRate(paymentData.currency, 'USD')
+  });
+}    
+
+const exchangeRate = paymentData.currency === 'USD' 
+      ? 1.0 
+      : CurrencyConverter.getExchangeRate(paymentData.currency, 'USD');
+
+    const supportedMethods = CurrencyConverter.getSupportedPaymentMethods(paymentData.currency);
+    const paymentOptions = supportedMethods.join(',');
+
+    // ✅ CRITICAL FIX: Send user's currency and amount to Flutterwave
+    const payload = {
+      tx_ref: reference,
+      amount: paymentData.amount.toString(), // ✅ User's amount in their currency
+      currency: paymentData.currency.toUpperCase(), // ✅ User's currency
+      redirect_url: paymentData.redirectUrl,
+      customer: {
+        email: paymentData.email,
+        name: paymentData.fullName || paymentData.email.split('@')[0],
+        ...(paymentData.phoneNumber && { phonenumber: paymentData.phoneNumber })
+      },
+      customizations: {
+        title: paymentData.type === 'subscription' ? 'Thryve Subscription' : 'Thryve Credits',
+        description: paymentData.type === 'subscription' 
+          ? 'Subscribe to unlock premium AI features' 
+          : 'Top up your AI credits',
+        logo: ''
+      },
+      meta: {
+        user_id: paymentData.userId,
+        type: paymentData.type,
+        plan_id: paymentData.planId || '',
+        platform_fee_usd: platformFeeUSD,
+        credit_amount: creditAmount,
+        exchange_rate: exchangeRate,
+        country: paymentData.country || 'NG',
+        // ✅ Store both amounts for reference
+        amount_usd: amountInUSD,
+        amount_local: paymentData.amount,
+        local_currency: paymentData.currency
+      },
+      payment_options: paymentOptions,
+      configurations: {
+        session_duration: 1440,
+        max_retry_attempt: 3
       }
+    };
 
-      if (!transaction) {
-        logger.error('Transaction not returned from database insert:', { reference });
-        throw new Error('Failed to create transaction record');
-      }
+    logger.info({ 
+      msg: 'Initializing Flutterwave payment', 
+      reference, 
+      currency: paymentData.currency, // ✅ User's currency
+      amountLocal: paymentData.amount, // ✅ Amount in user's currency
+      amountUSD: amountInUSD,
+      exchangeRate,
+      supportedMethods,
+      creditsToReceive: creditAmount,
+      platformFee: platformFeeUSD
+    });
 
-      logger.info('Transaction created successfully:', { 
-        transactionId: transaction.id,
+    // ✅ Store transaction record
+    const { data: transaction, error: dbError } = await supabase
+      .from('payment_transactions')
+      .insert({
+        user_id: paymentData.userId,
+        flutterwave_reference: reference,
+        flutterwave_transaction_id: null,
+        type: paymentData.type,
+        plan_id: paymentData.planId || null,
+        
+        // ✅ Store in user's currency
+        amount: paymentData.amount, // ✅ User's currency amount
+        currency: paymentData.currency, // ✅ User's currency
+        credit_amount: creditAmount,
+        
+        // Additional tracking fields
+        amount_usd: amountInUSD,
+        amount_local: paymentData.amount,
+        local_currency: paymentData.currency,
+        exchange_rate: exchangeRate,
+        openrouter_credit_amount: creditAmount,
+        platform_fee: platformFeeUSD,
+        status: 'pending',
+        country: paymentData.country || 'NG',
+        metadata: {
+          customer_info: {
+            email: paymentData.email,
+            name: paymentData.fullName || paymentData.email.split('@')[0],
+            phone: paymentData.phoneNumber
+          },
+          payload_sent: payload
+        }
+      })
+      .select()
+      .single();
+
+    if (dbError) {
+      logger.error('Failed to store payment transaction:', { 
+        error: dbError,
         reference,
+        userId: paymentData.userId,
         amount: paymentData.amount,
-        creditsToReceive: creditAmount
+        currency: paymentData.currency,
+        type: paymentData.type
       });
+      throw new Error(`Failed to record payment transaction: ${dbError.message}`);
+    }
 
-      // Continue with Flutterwave API call...
-      const response = await fetch(`${this.baseUrl}/payments`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.secretKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
+    if (!transaction) {
+      logger.error('Transaction not returned from database insert:', { reference });
+      throw new Error('Failed to create transaction record');
+    }
 
+    logger.info('Transaction created successfully:', { 
+      transactionId: transaction.id,
+      reference,
+      amountLocal: paymentData.amount,
+      currency: paymentData.currency,
+      creditsToReceive: creditAmount
+    });
 
+    // ✅ Send to Flutterwave API
+    const response = await fetch(`${this.baseUrl}/payments`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
 
-      const responseData = await response.json() as FlutterwaveResponse<FlutterwavePaymentResponse>;
+    const responseData = await response.json() as FlutterwaveResponse<FlutterwavePaymentResponse>;
 
-      if (!response.ok || responseData.status !== 'success') {
-        logger.error({ msg: 'Flutterwave payment initialization failed', response: responseData });
-        
-        // Update transaction status to failed
-        await supabase
-          .from('payment_transactions')
-          .update({ 
-            status: 'failed',
-            metadata: {
-              ...transaction.metadata,
-              failure_reason: responseData.message || 'Payment initialization failed',
-              error_response: responseData
-            },
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', transaction.id);
-        
-        throw new Error(`Payment initialization failed: ${responseData.message || 'Unknown error'}`);
-      }
-
-      const paymentUrl = responseData.data.link;
-
-      if (!paymentUrl) {
-        throw new Error('No payment link received from Flutterwave');
-      }
-
-      // ✅ FIXED: Update transaction with Flutterwave response using correct field names
+    if (!response.ok || responseData.status !== 'success') {
+      logger.error({ msg: 'Flutterwave payment initialization failed', response: responseData });
+      
       await supabase
         .from('payment_transactions')
-        .update({
-          flutterwave_transaction_id: responseData.data.id?.toString() || null, // ✅ FIXED
+        .update({ 
+          status: 'failed',
           metadata: {
             ...transaction.metadata,
-            flutterwave_response: responseData.data,
-            payment_link: paymentUrl
+            failure_reason: responseData.message || 'Payment initialization failed',
+            error_response: responseData
           },
           updated_at: new Date().toISOString()
         })
         .eq('id', transaction.id);
-
-      logger.info({ msg: 'Payment initialized successfully', reference, paymentUrl });
-
-      return {
-        paymentUrl,
-        reference,
-        transaction_id: responseData.data.id
-      };
-
-    } catch (error: any) {
-      logger.error({ msg: 'Error initializing payment', error: error.message,   stack: error.stack, paymentData });
-      throw error;
+      
+      throw new Error(`Payment initialization failed: ${responseData.message || 'Unknown error'}`);
     }
-  }
 
+    const paymentUrl = responseData.data.link;
+
+    if (!paymentUrl) {
+      throw new Error('No payment link received from Flutterwave');
+    }
+
+    // ✅ Update transaction with Flutterwave response
+    await supabase
+      .from('payment_transactions')
+      .update({
+        flutterwave_transaction_id: responseData.data.id?.toString() || null,
+        metadata: {
+          ...transaction.metadata,
+          flutterwave_response: responseData.data,
+          payment_link: paymentUrl
+        },
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', transaction.id);
+
+    logger.info({ 
+      msg: 'Payment initialized successfully', 
+      reference, 
+      currency: paymentData.currency,
+      amount: paymentData.amount,
+      paymentUrl 
+    });
+
+    return {
+      paymentUrl,
+      reference,
+      transaction_id: responseData.data.id
+    };
+
+  } catch (error: any) {
+    logger.error({ msg: 'Error initializing payment', error: error.message, stack: error.stack, paymentData });
+    throw error;
+  }
+}
   /**
    * ✅ FIXED: Verify payment using transaction ID with correct field names
    */
